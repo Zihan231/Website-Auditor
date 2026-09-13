@@ -265,3 +265,76 @@ async function runDemo(config: CrawlConfig, onEvent: (e: CrawlEvent) => void): P
   onEvent({ type: "done", summary: result.summary });
   return result;
 }
+
+export interface BatchRowInput {
+  index: number;
+  website: string;
+  currentEmail?: string;
+}
+
+export interface BatchRowOutput {
+  index: number;
+  website: string;
+  updatedEmail: string;
+  websiteAudit: string;
+  emailsFound: string[];
+  status: "success" | "skipped" | "error";
+}
+
+export async function auditBatch(
+  rows: BatchRowInput[],
+  maxPages: number,
+  timeoutSecs: number,
+  concurrency: number,
+  onRowCompleted: (row: BatchRowOutput) => void
+): Promise<BatchRowOutput[]> {
+  if (isTauri()) {
+    const { listen } = await import("@tauri-apps/api/event");
+    const un: Unlisten = await listen<BatchRowOutput>("batch-row-completed", (ev) => onRowCompleted(ev.payload));
+    try {
+      return await invoke<BatchRowOutput[]>("audit_batch", {
+        rows,
+        maxPages,
+        timeoutSecs,
+        concurrency,
+      });
+    } finally {
+      un();
+    }
+  }
+  return runBatchDemo(rows, onRowCompleted);
+}
+
+export async function cancelBatch(): Promise<void> {
+  if (isTauri()) await invoke("cancel_batch");
+}
+
+async function runBatchDemo(
+  rows: BatchRowInput[],
+  onRowCompleted: (row: BatchRowOutput) => void
+): Promise<BatchRowOutput[]> {
+  const results: BatchRowOutput[] = [];
+  for (const row of rows) {
+    await new Promise((r) => setTimeout(r, 100));
+    const out: BatchRowOutput = row.website.trim()
+      ? {
+          index: row.index,
+          website: row.website,
+          updatedEmail: row.currentEmail ? `${row.currentEmail}, contact@example.com` : "contact@example.com",
+          websiteAudit: `--- WEBSITE AUDIT REPORT ---\nSITE: ${row.website}\nSTATUS: Active (200 OK)\nPAGES_CRAWLED: 10\nOVERALL_SCORES:\n  Health: 85/100\n  GEO (AI-Search Readiness): 72/100\n  Accessibility (WCAG): 96/100\nTECHNICAL_HEALTH:\n  Avg Response Time: 240ms\n  SSL/HTTPS: Valid\n  Robots.txt: Found\n  Sitemap: Found\nSEO_FINDINGS:\n  Title Tags: All Present\n  Meta Descriptions: 1 Missing\n  Broken Links: 0\nEMAILS_DISCOVERED:\n  - contact@example.com`,
+          emailsFound: ["contact@example.com"],
+          status: "success",
+        }
+      : {
+          index: row.index,
+          website: "",
+          updatedEmail: row.currentEmail || "",
+          websiteAudit: "no website",
+          emailsFound: [],
+          status: "skipped",
+        };
+    onRowCompleted(out);
+    results.push(out);
+  }
+  return results;
+}

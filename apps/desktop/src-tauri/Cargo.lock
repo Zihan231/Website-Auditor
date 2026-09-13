@@ -704,6 +704,7 @@ name = "crawlie-desktop"
 version = "0.5.3"
 dependencies = [
  "crawlie-core",
+ "futures",
  "serde",
  "serde_json",
  "tauri",

@@ -1,6 +1,7 @@
 //! Tauri shell for crawlie. A thin layer over `crawlie-core`: crawl commands
 //! that stream progress, plus saved-report history backed by the core
 //! `ReportStore` in the app data directory.
+//! Updated batch audit reporting.
 
 use crawlie_core::{
     crawl, report_html, CancelToken, CrawlConfig, CrawlDiff, CrawlResult, ReportMeta, ReportStore,
@@ -13,6 +14,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 #[derive(Default)]
 struct CrawlState {
     cancel: Mutex<Option<CancelToken>>,
+    batch_cancel: Mutex<Option<CancelToken>>,
 }
 
 /// User-configurable app settings, persisted to `settings.json` in the app data
@@ -102,6 +104,169 @@ async fn start_crawl(app: AppHandle, config: CrawlConfig) -> Result<CrawlResult,
 #[tauri::command]
 fn cancel_crawl(state: State<'_, CrawlState>) {
     if let Some(token) = state.cancel.lock().unwrap().as_ref() {
+        token.cancel();
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRowInput {
+    pub index: usize,
+    pub website: String,
+    pub current_email: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRowOutput {
+    pub index: usize,
+    pub website: String,
+    pub updated_email: String,
+    pub website_audit: String,
+    pub emails_found: Vec<String>,
+    pub status: String,
+}
+
+#[tauri::command]
+async fn audit_batch(
+    app: AppHandle,
+    rows: Vec<BatchRowInput>,
+    max_pages: usize,
+    timeout_secs: u64,
+    concurrency: usize,
+) -> Result<Vec<BatchRowOutput>, String> {
+    let token = CancelToken::new();
+    {
+        let state = app.state::<CrawlState>();
+        *state.batch_cancel.lock().unwrap() = Some(token.clone());
+    }
+
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency.clamp(1, 30)));
+    let mut tasks = futures::stream::FuturesUnordered::new();
+
+    for row in rows {
+        let app_handle = app.clone();
+        let token_clone = token.clone();
+        let sem_clone = sem.clone();
+
+        tasks.push(async move {
+            let website_trimmed = row.website.trim().to_string();
+
+            // If website is empty or missing, output "no website"
+            if website_trimmed.is_empty() {
+                let out = BatchRowOutput {
+                    index: row.index,
+                    website: row.website,
+                    updated_email: row.current_email.unwrap_or_default(),
+                    website_audit: "no website".to_string(),
+                    emails_found: Vec::new(),
+                    status: "skipped".to_string(),
+                };
+                let _ = app_handle.emit("batch-row-completed", &out);
+                return out;
+            }
+
+            // If cancelled before starting
+            if token_clone.is_cancelled() {
+                let out = BatchRowOutput {
+                    index: row.index,
+                    website: row.website,
+                    updated_email: row.current_email.unwrap_or_default(),
+                    website_audit: "Error: Cancelled".to_string(),
+                    emails_found: Vec::new(),
+                    status: "error".to_string(),
+                };
+                let _ = app_handle.emit("batch-row-completed", &out);
+                return out;
+            }
+
+            // Normalize URL
+            let norm_url = match crawlie_core::normalize_target_url(&website_trimmed) {
+                Some(u) => u,
+                None => {
+                    let out = BatchRowOutput {
+                        index: row.index,
+                        website: row.website,
+                        updated_email: row.current_email.unwrap_or_default(),
+                        website_audit: "Error: Invalid website URL".to_string(),
+                        emails_found: Vec::new(),
+                        status: "error".to_string(),
+                    };
+                    let _ = app_handle.emit("batch-row-completed", &out);
+                    return out;
+                }
+            };
+
+            // Acquire concurrency permit
+            let _permit = sem_clone.acquire().await.ok();
+
+            if token_clone.is_cancelled() {
+                let out = BatchRowOutput {
+                    index: row.index,
+                    website: row.website,
+                    updated_email: row.current_email.unwrap_or_default(),
+                    website_audit: "Error: Cancelled".to_string(),
+                    emails_found: Vec::new(),
+                    status: "error".to_string(),
+                };
+                let _ = app_handle.emit("batch-row-completed", &out);
+                return out;
+            }
+
+            // Run audit on site
+            let outcome = crawlie_core::audit_website_for_batch(
+                &norm_url,
+                max_pages,
+                timeout_secs,
+                token_clone.clone(),
+            )
+            .await;
+
+            let updated_email = if outcome.success && !outcome.emails.is_empty() {
+                crawlie_core::merge_emails(row.current_email.as_deref(), &outcome.emails)
+            } else {
+                row.current_email.unwrap_or_default()
+            };
+
+            let status = if outcome.success {
+                "success".to_string()
+            } else {
+                "error".to_string()
+            };
+
+            let out = BatchRowOutput {
+                index: row.index,
+                website: row.website,
+                updated_email,
+                website_audit: outcome.report,
+                emails_found: outcome.emails,
+                status,
+            };
+
+            let _ = app_handle.emit("batch-row-completed", &out);
+            out
+        });
+    }
+
+    use futures::StreamExt;
+    let mut results = Vec::new();
+    while let Some(out) = tasks.next().await {
+        results.push(out);
+    }
+
+    results.sort_by_key(|r| r.index);
+
+    {
+        let state = app.state::<CrawlState>();
+        *state.batch_cancel.lock().unwrap() = None;
+    }
+
+    Ok(results)
+}
+
+#[tauri::command]
+fn cancel_batch(state: State<'_, CrawlState>) {
+    if let Some(token) = state.batch_cancel.lock().unwrap().as_ref() {
         token.cancel();
     }
 }
@@ -223,6 +388,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_crawl,
             cancel_crawl,
+            audit_batch,
+            cancel_batch,
             list_reports,
             load_report,
             delete_report,

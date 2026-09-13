@@ -7,14 +7,17 @@ import { CrawlingView, type Progress } from "./views/CrawlingView";
 import { ResultsView } from "./views/ResultsView";
 import { ReportsView } from "./views/ReportsView";
 import { SettingsView } from "./views/SettingsView";
+import { BulkAuditView } from "./views/BulkAuditView";
 import { AccountControl } from "./components/AccountControl";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { FileSpreadsheet } from "lucide-react";
 
 type Phase =
   | { name: "idle" }
   | { name: "crawling"; config: CrawlConfig; progress: Progress }
   | { name: "done"; result: CrawlResult }
   | { name: "reports" }
+  | { name: "bulk" }
   | { name: "settings" }
   | { name: "error"; message: string };
 
@@ -90,6 +93,13 @@ export function App() {
           >
             <IconHistory size={16} /> <span className="nav-label">Reports</span>
           </button>
+          <button
+            className={`nav-item${phase.name === "bulk" ? " active" : ""}`}
+            onClick={() => setPhase({ name: "bulk" })}
+            title="Bulk CSV Audit & Enrichment"
+          >
+            <FileSpreadsheet size={16} /> <span className="nav-label">Bulk Audit</span>
+          </button>
         </nav>
         <div className="sidebar-foot">
           <a
@@ -136,6 +146,7 @@ export function App() {
         {phase.name === "crawling" && <CrawlingView config={phase.config} progress={phase.progress} onCancel={cancel} />}
         {phase.name === "done" && <ResultsView result={phase.result} onReset={reset} onReports={() => setPhase({ name: "reports" })} />}
         {phase.name === "reports" && <ReportsView onBack={reset} onOpen={(r) => setPhase({ name: "done", result: r })} />}
+        {phase.name === "bulk" && <BulkAuditView onBack={reset} />}
         {phase.name === "settings" && <SettingsView onBack={reset} />}
         {phase.name === "error" && (
           <div className="hero">

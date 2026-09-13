@@ -16,6 +16,7 @@
 //! ```
 
 pub mod audit;
+pub mod batch;
 pub mod crawler;
 pub mod dedup;
 pub mod fetch;
@@ -37,6 +38,10 @@ pub mod structured_data;
 pub mod timefmt;
 pub mod types;
 
+pub use batch::{
+    audit_website_for_batch, extract_emails_from_text, format_audit_report, is_valid_email,
+    merge_emails, normalize_target_url, BatchAuditOutcome,
+};
 pub use crawler::{crawl, crawl_to_store, CancelToken};
 pub use knowledge::{all_rules, rule_info};
 pub use pagestore::PageStore;
