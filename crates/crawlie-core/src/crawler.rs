@@ -396,7 +396,11 @@ struct Prep {
     concurrency: usize,
 }
 
-async fn prepare<F>(config: &CrawlConfig, on_event: &mut F) -> Result<Prep, CrawlError>
+async fn prepare<F>(
+    config: &CrawlConfig,
+    on_event: &mut F,
+    shared_renderer: Option<&Arc<Renderer>>,
+) -> Result<Prep, CrawlError>
 where
     F: FnMut(CrawlEvent),
 {
@@ -442,12 +446,18 @@ where
     }
 
     // Launch the headless browser once, up front, so a misconfigured render mode
-    // fails the crawl immediately instead of after fetching the seed.
+    // fails the crawl immediately instead of after fetching the seed. A caller
+    // that already has a browser running (e.g. bulk audit, sharing one instance
+    // across many sites) passes it in via `shared_renderer` instead.
     let renderer = if config.render {
-        let nav_timeout = config.timeout_secs.saturating_mul(2).max(20);
-        match Renderer::launch(None, nav_timeout).await {
-            Ok(r) => Some(Arc::new(r)),
-            Err(e) => return Err(CrawlError::Config(format!("render mode: {e}"))),
+        if let Some(shared) = shared_renderer {
+            Some(shared.clone())
+        } else {
+            let nav_timeout = config.timeout_secs.saturating_mul(2).max(20);
+            match Renderer::launch(None, nav_timeout).await {
+                Ok(r) => Some(Arc::new(r)),
+                Err(e) => return Err(CrawlError::Config(format!("render mode: {e}"))),
+            }
         }
     } else {
         None
@@ -600,9 +610,25 @@ fn sitemap_limit_issues(stats: &[sitemap::SitemapStat], out: &mut Vec<Issue>) {
 /// Run a full crawl + audit. `on_event` receives streaming progress; `cancel`
 /// can stop the crawl early (the partial result is still returned).
 pub async fn crawl<F>(
+    config: CrawlConfig,
+    on_event: F,
+    cancel: CancelToken,
+) -> Result<CrawlResult, CrawlError>
+where
+    F: FnMut(CrawlEvent) + Send,
+{
+    crawl_with_renderer(config, on_event, cancel, None).await
+}
+
+/// Same as [`crawl`], but when `config.render` is on and `shared_renderer` is
+/// `Some`, reuses that already-running browser instead of launching a new one
+/// — for callers (bulk audit) that run many crawls and want one shared
+/// browser process instead of one per crawl.
+pub async fn crawl_with_renderer<F>(
     mut config: CrawlConfig,
     mut on_event: F,
     cancel: CancelToken,
+    shared_renderer: Option<Arc<Renderer>>,
 ) -> Result<CrawlResult, CrawlError>
 where
     F: FnMut(CrawlEvent) + Send,
@@ -629,7 +655,7 @@ where
         max_pages,
         follow,
         concurrency,
-    } = prepare(&config, &mut on_event).await?;
+    } = prepare(&config, &mut on_event, shared_renderer.as_ref()).await?;
 
     let mut pages: Vec<Page> = Vec::new();
     // Normalized final URLs already recorded as a page. A redirect that lands on
@@ -1038,7 +1064,7 @@ where
         max_pages,
         follow,
         concurrency,
-    } = prepare(&config, &mut on_event).await?;
+    } = prepare(&config, &mut on_event, None).await?;
 
     // --- Fetch loop: each finished page is written to disk, not retained. ---
     let mut inflight = FuturesUnordered::new();

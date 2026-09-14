@@ -139,16 +139,29 @@ fn detect_chrome() -> Option<String> {
         // Windows
         "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
         "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+        "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+        "C:\\Program Files\\Chromium\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Chromium\\Application\\chrome.exe",
     ];
     if let Ok(env) = std::env::var("CHROME") {
         if !env.is_empty() && std::path::Path::new(&env).exists() {
             return Some(env);
         }
     }
-    CANDIDATES
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .map(|p| p.to_string())
+    if let Some(found) = CANDIDATES.iter().find(|p| std::path::Path::new(p).exists()) {
+        return Some(found.to_string());
+    }
+    // Per-user Chrome installs (no admin rights) live under %LOCALAPPDATA%,
+    // which the static candidate list above can never cover.
+    #[cfg(target_os = "windows")]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let p = format!("{local}\\Google\\Chrome\\Application\\chrome.exe");
+        if std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Resource patterns blocked on "light" renders (pages outside the vitals
@@ -182,6 +195,15 @@ mod real {
         handler: Option<JoinHandle<()>>,
         /// Hard ceiling on how long any one page render may take.
         nav_timeout: Duration,
+        /// Caps how many tabs (render *or* PDF-print) this browser holds open
+        /// at once. Each tab is its own OS process under Chrome's architecture,
+        /// so this is a real memory cap, not just a concurrency nicety — matters
+        /// most when one `Renderer` is shared across many concurrent crawls
+        /// (bulk audit), where each crawl's own concurrency setting would
+        /// otherwise multiply unchecked across rows. `None` (the default single-
+        /// crawl case) leaves it unbounded — one crawl's own concurrency setting
+        /// already keeps that reasonable on its own.
+        tab_limit: Option<tokio::sync::Semaphore>,
     }
 
     impl Renderer {
@@ -192,12 +214,49 @@ mod real {
             chrome_path: Option<String>,
             nav_timeout_secs: u64,
         ) -> Result<Self, String> {
+            Self::launch_inner(chrome_path, nav_timeout_secs, None).await
+        }
+
+        /// Same as [`Self::launch`], but caps total concurrent tabs (across
+        /// every caller sharing this instance) at `max_tabs`. Use this whenever
+        /// one `Renderer` will be reused across multiple concurrent crawls —
+        /// without it, each crawl's own concurrency setting multiplies by however
+        /// many crawls are running at once, with no shared ceiling.
+        pub async fn launch_shared(
+            chrome_path: Option<String>,
+            nav_timeout_secs: u64,
+            max_tabs: usize,
+        ) -> Result<Self, String> {
+            Self::launch_inner(chrome_path, nav_timeout_secs, Some(max_tabs.max(1))).await
+        }
+
+        async fn launch_inner(
+            chrome_path: Option<String>,
+            nav_timeout_secs: u64,
+            max_tabs: Option<usize>,
+        ) -> Result<Self, String> {
             let exe = chrome_path.or_else(detect_chrome).ok_or_else(|| {
                 "no Chrome/Chromium/Edge found — install one or set $CHROME to its path".to_string()
             })?;
 
+            // A private, process-unique profile directory. Without this, Chrome/
+            // Edge's single-instance-per-profile lock means launching against the
+            // default profile while the user's own browser is already open just
+            // forwards the request to that running instance and exits immediately
+            // — "exited before websocket URL could be resolved". A fresh temp dir
+            // guarantees no collision with any browser the user already has open.
+            let profile_dir = std::env::temp_dir().join(format!(
+                "crawlie-chrome-profile-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+            ));
+
             let config = BrowserConfig::builder()
                 .chrome_executable(exe)
+                .user_data_dir(profile_dir)
                 .new_headless_mode()
                 // A real, modern desktop UA so sites serve their JS app, not a
                 // bot/legacy fallback.
@@ -218,6 +277,7 @@ mod real {
                 browser,
                 handler: Some(task),
                 nav_timeout: Duration::from_secs(nav_timeout_secs.max(1)),
+                tab_limit: max_tabs.map(tokio::sync::Semaphore::new),
             })
         }
 
@@ -239,6 +299,13 @@ mod real {
             custom_js: Option<&str>,
             full: bool,
         ) -> Result<super::Rendered, String> {
+            // Wait for a free tab slot *outside* the per-page timeout — queueing
+            // behind other tabs (when this Renderer is shared and busy) isn't the
+            // same failure as this page itself being slow.
+            let _permit = match &self.tab_limit {
+                Some(sem) => Some(sem.acquire().await.map_err(|e| e.to_string())?),
+                None => None,
+            };
             let fut = self.render_inner(url, wait_ms, custom_js, full);
             match tokio::time::timeout(self.nav_timeout, fut).await {
                 Ok(res) => res,
@@ -346,6 +413,13 @@ mod real {
         /// Load `url` (typically a `file://` report) and print it to PDF.
         pub async fn pdf(&self, url: &Url) -> Result<Vec<u8>, String> {
             use chromiumoxide::cdp::browser_protocol::page::PrintToPdfParams;
+            // Same shared tab budget as `render_html` — a PDF print is a tab
+            // like any other, and the two shouldn't be able to add up past the
+            // cap when both are happening on the same shared browser.
+            let _permit = match &self.tab_limit {
+                Some(sem) => Some(sem.acquire().await.map_err(|e| e.to_string())?),
+                None => None,
+            };
             let fut = async {
                 let page = self
                     .browser
@@ -391,6 +465,18 @@ mod stub {
         pub async fn launch(
             _chrome_path: Option<String>,
             _nav_timeout_secs: u64,
+        ) -> Result<Self, String> {
+            Err(
+                "this build of crawlie was compiled without JavaScript rendering \
+                 (the `render` feature)"
+                    .to_string(),
+            )
+        }
+
+        pub async fn launch_shared(
+            _chrome_path: Option<String>,
+            _nav_timeout_secs: u64,
+            _max_tabs: usize,
         ) -> Result<Self, String> {
             Err(
                 "this build of crawlie was compiled without JavaScript rendering \

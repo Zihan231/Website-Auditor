@@ -7,14 +7,20 @@ use crawlie_core::{
     crawl, report_html, CancelToken, CrawlConfig, CrawlDiff, CrawlResult, ReportMeta, ReportStore,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Default)]
 struct CrawlState {
     cancel: Mutex<Option<CancelToken>>,
     batch_cancel: Mutex<Option<CancelToken>>,
+    /// The detached background PDF-rendering worker for the most recent batch
+    /// run, if any is still draining. Aborted when a new batch starts or the
+    /// batch is cancelled, so runs never overlap.
+    pdf_worker: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 /// User-configurable app settings, persisted to `settings.json` in the app data
@@ -125,108 +131,361 @@ pub struct BatchRowOutput {
     pub website_audit: String,
     pub emails_found: Vec<String>,
     pub status: String,
+    /// Absolute path to this row's PDF audit report, filled in later via a
+    /// `batch-pdf-ready` event — always `None` at the moment the row itself
+    /// completes, since PDF rendering runs on a decoupled background worker
+    /// that never blocks the audit (see `audit_batch`).
+    pub pdf_path: Option<String>,
+}
+
+/// One site queued for the background PDF worker: the rendered client-summary
+/// HTML plus every row index that shares this site (rows are deduped by
+/// normalized URL — a site listed more than once in the spreadsheet is
+/// crawled and PDF'd once, not once per duplicate row).
+struct PdfJob {
+    indices: Vec<usize>,
+    url: String,
+    html: String,
+}
+
+/// Emitted once a queued row's PDF finishes (or definitively fails) — arrives
+/// independently of, and generally after, that row's `batch-row-completed`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PdfReady {
+    index: usize,
+    pdf_path: Option<String>,
+}
+
+/// Hard cap on concurrent tabs across the *entire* batch's shared browser —
+/// both JS-rendered crawl pages and PDF prints draw from this one budget.
+/// Each tab is its own OS process under Chrome's architecture, so this is a
+/// real memory cap: without it, `row_concurrency` sites running in parallel,
+/// each opening up to `config.concurrency` tabs for its own pages, multiply
+/// unchecked (e.g. 25 rows × 16 = 400+ tabs, several GB of RAM). Deliberately
+/// independent of, and much smaller than, either concurrency slider.
+const MAX_SHARED_RENDERER_TABS: usize = 6;
+/// Conservative per-PDF size estimate for the disk-space preflight check.
+/// Recalibrate from real batches once there's field data.
+const ESTIMATED_PDF_BYTES: u64 = 1_500_000;
+/// Always leave at least this much free on the destination drive.
+const MIN_HEADROOM_BYTES: u64 = 1_000_000_000;
+/// How often (in PDFs written) to re-check free space mid-run.
+const DISK_RECHECK_INTERVAL: usize = 250;
+
+/// Render one site's report HTML to a PDF via the shared headless browser,
+/// writing it into `dir` as `<host>.pdf` — one flat folder, one file per site;
+/// a rerun of the same site overwrites its previous PDF with the fresh one.
+/// Mirrors crawlie-cli's `export_pdf`. Any failure at any step (temp write,
+/// navigation, print, final write) just yields `None` — a single site's PDF
+/// never aborts anything else. `temp_tag` only keeps concurrent temp HTML
+/// files from colliding; it isn't part of the final filename.
+async fn render_pdf_for_site(
+    renderer: &crawlie_core::render::Renderer,
+    html: &str,
+    dir: &PathBuf,
+    url_str: &str,
+    temp_tag: usize,
+) -> Option<String> {
+    let tmp = std::env::temp_dir().join(format!("crawlie-batch-{}-{}.html", std::process::id(), temp_tag));
+    std::fs::write(&tmp, html).ok()?;
+    let file_url = url::Url::from_file_path(&tmp).ok();
+    let bytes = match &file_url {
+        Some(u) => renderer.pdf(u).await.ok(),
+        None => None,
+    };
+    let _ = std::fs::remove_file(&tmp);
+    let bytes = bytes?;
+
+    let host = url::Url::parse(url_str)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.replace('.', "-")))
+        .unwrap_or_else(|| "site".into());
+    let path = dir.join(format!("{host}.pdf"));
+    std::fs::write(&path, bytes).ok()?;
+    Some(path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
 async fn audit_batch(
     app: AppHandle,
     rows: Vec<BatchRowInput>,
-    max_pages: usize,
-    timeout_secs: u64,
-    concurrency: usize,
+    mut config: CrawlConfig,
+    row_concurrency: usize,
+    // User-chosen PDF output folder (via a native picker). `None` falls back
+    // to Downloads, matching `save_html_report`'s convention.
+    pdf_dir_override: Option<String>,
 ) -> Result<Vec<BatchRowOutput>, String> {
     let token = CancelToken::new();
     {
         let state = app.state::<CrawlState>();
         *state.batch_cancel.lock().unwrap() = Some(token.clone());
+        // A previous run's PDF worker (if still draining) must not keep
+        // writing into this run's directory or racing its events.
+        if let Some(h) = state.pdf_worker.lock().unwrap().take() {
+            h.abort();
+        };
     }
 
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency.clamp(1, 30)));
+    // `config` is a per-run template — every row clones it and re-targets
+    // `url` (see `config_for_row`). `row_concurrency` is a separate axis from
+    // `config.concurrency`: how many *sites* run in parallel, vs. how many
+    // requests each site's own crawl makes at once.
+    let want_render_js = config.render;
+
+    // --- Shared headless browser: launched at most once per batch (never
+    // once per row), reused by every JS-rendered row's crawl AND by the PDF
+    // pipeline below. Neither ever blocks or slows the audit itself — each
+    // is either fully ready before any row starts, or skipped entirely (with
+    // one warning) and rows proceed as if it didn't exist. ---
+    // One flat, stable folder — never a new subfolder per run. A user-chosen
+    // folder (via the picker) is used exactly as given; the default lives
+    // under Downloads. Re-running the same site overwrites its previous PDF.
+    let pdf_dir = match pdf_dir_override {
+        Some(dir) => PathBuf::from(dir),
+        None => app
+            .path()
+            .download_dir()
+            .or_else(|_| app.path().app_data_dir())
+            .map_err(|e| e.to_string())?
+            .join("crawlie-pdf-reports"),
+    };
+
+    // Rows sharing a normalized URL (a site listed more than once in the
+    // spreadsheet) are crawled and PDF'd once — see the grouping below. The
+    // disk-space estimate should reflect that real count, not the raw row count.
+    let unique_site_count = {
+        let mut seen = std::collections::HashSet::new();
+        for row in &rows {
+            let trimmed = row.website.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(norm) = crawlie_core::normalize_target_url(trimmed) {
+                seen.insert(norm);
+            }
+        }
+        seen.len()
+    };
+
+    let pdf_storage_ok = if std::fs::create_dir_all(&pdf_dir).is_err() {
+        false
+    } else {
+        let required = ESTIMATED_PDF_BYTES
+            .saturating_mul(unique_site_count as u64)
+            .saturating_mul(13)
+            / 10
+            + MIN_HEADROOM_BYTES;
+        let free = fs4::available_space(&pdf_dir).unwrap_or(u64::MAX);
+        if free < required {
+            let _ = app.emit(
+                "batch-pdf-warning",
+                format!(
+                    "Not enough free disk space for PDF reports (need ~{:.1} GB, only ~{:.1} GB free) — \
+                     PDF generation is disabled for this run, but audits will continue.",
+                    required as f64 / 1e9,
+                    free as f64 / 1e9,
+                ),
+            );
+            false
+        } else {
+            true
+        }
+    };
+
+    let mut shared_renderer: Option<Arc<crawlie_core::render::Renderer>> = None;
+    let mut pdf_tx: Option<tokio::sync::mpsc::UnboundedSender<PdfJob>> = None;
+
+    if pdf_storage_ok || want_render_js {
+        match crawlie_core::render::Renderer::launch_shared(None, 45, MAX_SHARED_RENDERER_TABS).await {
+            Err(e) => {
+                let mut disabled = Vec::new();
+                if pdf_storage_ok {
+                    disabled.push("PDF report generation");
+                }
+                if want_render_js {
+                    disabled.push("JavaScript rendering");
+                }
+                let _ = app.emit(
+                    "batch-pdf-warning",
+                    format!(
+                        "Chrome/Edge not found — {} disabled for this run, but audits will continue. ({e})",
+                        disabled.join(" and "),
+                    ),
+                );
+                // Never fall back to a per-row browser launch — force it off
+                // so `crawl_with_renderer` doesn't try (and fail) per row.
+                config.render = false;
+            }
+            Ok(renderer) => {
+                let renderer = Arc::new(renderer);
+                shared_renderer = Some(renderer.clone());
+
+                if pdf_storage_ok {
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PdfJob>();
+                    pdf_tx = Some(tx);
+
+                    let app_for_worker = app.clone();
+                    let dir = pdf_dir.clone();
+                    let handle = tauri::async_runtime::spawn(async move {
+                        let written = Arc::new(AtomicUsize::new(0));
+                        let low_disk = Arc::new(AtomicBool::new(false));
+
+                        // No local semaphore here: `renderer.pdf()` already
+                        // queues behind the browser's own shared tab budget
+                        // (`MAX_SHARED_RENDERER_TABS`), the same one JS-rendered
+                        // crawl pages draw from — one real ceiling on concurrent
+                        // tabs, not two independent ones that could add up.
+                        while let Some(job) = rx.recv().await {
+                            if low_disk.load(Ordering::Relaxed) {
+                                for idx in &job.indices {
+                                    let _ = app_for_worker.emit(
+                                        "batch-pdf-ready",
+                                        PdfReady { index: *idx, pdf_path: None },
+                                    );
+                                }
+                                continue;
+                            }
+                            let renderer = renderer.clone();
+                            let dir = dir.clone();
+                            let app_for_job = app_for_worker.clone();
+                            let written = written.clone();
+                            let low_disk = low_disk.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let temp_tag = job.indices.first().copied().unwrap_or(0);
+                                let pdf_path =
+                                    render_pdf_for_site(&renderer, &job.html, &dir, &job.url, temp_tag).await;
+                                for idx in &job.indices {
+                                    let _ = app_for_job.emit(
+                                        "batch-pdf-ready",
+                                        PdfReady { index: *idx, pdf_path: pdf_path.clone() },
+                                    );
+                                }
+
+                                let n = written.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n % DISK_RECHECK_INTERVAL == 0
+                                    && fs4::available_space(&dir).unwrap_or(u64::MAX) < MIN_HEADROOM_BYTES
+                                    && !low_disk.swap(true, Ordering::Relaxed)
+                                {
+                                    let _ = app_for_job.emit(
+                                        "batch-pdf-warning",
+                                        "Disk space is running low — PDF generation has been disabled for the remaining rows in this batch.".to_string(),
+                                    );
+                                }
+                            });
+                        }
+                    });
+
+                    let state = app.state::<CrawlState>();
+                    *state.pdf_worker.lock().unwrap() = Some(handle);
+                }
+            }
+        }
+    }
+    let want_pdf = pdf_tx.is_some();
+    let config = config;
+
+    // Group rows by normalized target URL — a site listed more than once in
+    // the spreadsheet (common in scraped lead lists) is crawled and PDF'd
+    // once, not once per duplicate row. Empty/invalid rows need no crawl and
+    // are resolved immediately, outside the grouped work below.
+    let mut groups: HashMap<String, Vec<BatchRowInput>> = HashMap::new();
+    let mut results: Vec<BatchRowOutput> = Vec::new();
+    for row in rows {
+        let website_trimmed = row.website.trim().to_string();
+        if website_trimmed.is_empty() {
+            let out = BatchRowOutput {
+                index: row.index,
+                website: row.website,
+                updated_email: row.current_email.unwrap_or_default(),
+                website_audit: "no website".to_string(),
+                emails_found: Vec::new(),
+                status: "skipped".to_string(),
+                pdf_path: None,
+            };
+            let _ = app.emit("batch-row-completed", &out);
+            results.push(out);
+            continue;
+        }
+        match crawlie_core::normalize_target_url(&website_trimmed) {
+            Some(norm) => groups.entry(norm).or_default().push(row),
+            None => {
+                let out = BatchRowOutput {
+                    index: row.index,
+                    website: row.website,
+                    updated_email: row.current_email.unwrap_or_default(),
+                    website_audit: "Error: Invalid website URL".to_string(),
+                    emails_found: Vec::new(),
+                    status: "error".to_string(),
+                    pdf_path: None,
+                };
+                let _ = app.emit("batch-row-completed", &out);
+                results.push(out);
+            }
+        }
+    }
+
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(row_concurrency.clamp(1, 30)));
     let mut tasks = futures::stream::FuturesUnordered::new();
 
-    for row in rows {
+    for (norm_url, group_rows) in groups {
         let app_handle = app.clone();
         let token_clone = token.clone();
         let sem_clone = sem.clone();
+        let pdf_tx_clone = pdf_tx.clone();
+        let config_template = config.clone();
+        let renderer_clone = shared_renderer.clone();
 
         tasks.push(async move {
-            let website_trimmed = row.website.trim().to_string();
-
-            // If website is empty or missing, output "no website"
-            if website_trimmed.is_empty() {
-                let out = BatchRowOutput {
-                    index: row.index,
-                    website: row.website,
-                    updated_email: row.current_email.unwrap_or_default(),
-                    website_audit: "no website".to_string(),
-                    emails_found: Vec::new(),
-                    status: "skipped".to_string(),
-                };
-                let _ = app_handle.emit("batch-row-completed", &out);
-                return out;
-            }
-
             // If cancelled before starting
             if token_clone.is_cancelled() {
-                let out = BatchRowOutput {
-                    index: row.index,
-                    website: row.website,
-                    updated_email: row.current_email.unwrap_or_default(),
-                    website_audit: "Error: Cancelled".to_string(),
-                    emails_found: Vec::new(),
-                    status: "error".to_string(),
-                };
-                let _ = app_handle.emit("batch-row-completed", &out);
-                return out;
-            }
-
-            // Normalize URL
-            let norm_url = match crawlie_core::normalize_target_url(&website_trimmed) {
-                Some(u) => u,
-                None => {
+                let mut outs = Vec::with_capacity(group_rows.len());
+                for row in group_rows {
                     let out = BatchRowOutput {
                         index: row.index,
                         website: row.website,
                         updated_email: row.current_email.unwrap_or_default(),
-                        website_audit: "Error: Invalid website URL".to_string(),
+                        website_audit: "Error: Cancelled".to_string(),
                         emails_found: Vec::new(),
                         status: "error".to_string(),
+                        pdf_path: None,
                     };
                     let _ = app_handle.emit("batch-row-completed", &out);
-                    return out;
+                    outs.push(out);
                 }
-            };
+                return outs;
+            }
 
-            // Acquire concurrency permit
+            // Acquire concurrency permit (one permit per unique site, not per row)
             let _permit = sem_clone.acquire().await.ok();
 
             if token_clone.is_cancelled() {
-                let out = BatchRowOutput {
-                    index: row.index,
-                    website: row.website,
-                    updated_email: row.current_email.unwrap_or_default(),
-                    website_audit: "Error: Cancelled".to_string(),
-                    emails_found: Vec::new(),
-                    status: "error".to_string(),
-                };
-                let _ = app_handle.emit("batch-row-completed", &out);
-                return out;
+                let mut outs = Vec::with_capacity(group_rows.len());
+                for row in group_rows {
+                    let out = BatchRowOutput {
+                        index: row.index,
+                        website: row.website,
+                        updated_email: row.current_email.unwrap_or_default(),
+                        website_audit: "Error: Cancelled".to_string(),
+                        emails_found: Vec::new(),
+                        status: "error".to_string(),
+                        pdf_path: None,
+                    };
+                    let _ = app_handle.emit("batch-row-completed", &out);
+                    outs.push(out);
+                }
+                return outs;
             }
 
-            // Run audit on site
+            // Run the audit once for this site, regardless of how many rows share it
+            let row_config = crawlie_core::config_for_row(&config_template, &norm_url);
             let outcome = crawlie_core::audit_website_for_batch(
-                &norm_url,
-                max_pages,
-                timeout_secs,
+                row_config,
                 token_clone.clone(),
+                want_pdf,
+                renderer_clone,
             )
             .await;
-
-            let updated_email = if outcome.success && !outcome.emails.is_empty() {
-                crawlie_core::merge_emails(row.current_email.as_deref(), &outcome.emails)
-            } else {
-                row.current_email.unwrap_or_default()
-            };
 
             let status = if outcome.success {
                 "success".to_string()
@@ -234,24 +493,44 @@ async fn audit_batch(
                 "error".to_string()
             };
 
-            let out = BatchRowOutput {
-                index: row.index,
-                website: row.website,
-                updated_email,
-                website_audit: outcome.report,
-                emails_found: outcome.emails,
-                status,
-            };
+            // Hand the rendered HTML off to the background PDF worker —
+            // non-blocking, so this site's rows complete at exactly the same
+            // speed whether or not PDF generation is active. One PDF covers
+            // every row sharing this site.
+            if let (Some(tx), Some(html)) = (&pdf_tx_clone, &outcome.report_html) {
+                let _ = tx.send(PdfJob {
+                    indices: group_rows.iter().map(|r| r.index).collect(),
+                    url: norm_url.clone(),
+                    html: html.clone(),
+                });
+            }
 
-            let _ = app_handle.emit("batch-row-completed", &out);
-            out
+            let mut outs = Vec::with_capacity(group_rows.len());
+            for row in group_rows {
+                let updated_email = if outcome.success && !outcome.emails.is_empty() {
+                    crawlie_core::merge_emails(row.current_email.as_deref(), &outcome.emails)
+                } else {
+                    row.current_email.unwrap_or_default()
+                };
+                let out = BatchRowOutput {
+                    index: row.index,
+                    website: row.website,
+                    updated_email,
+                    website_audit: outcome.report.clone(),
+                    emails_found: outcome.emails.clone(),
+                    status: status.clone(),
+                    pdf_path: None,
+                };
+                let _ = app_handle.emit("batch-row-completed", &out);
+                outs.push(out);
+            }
+            outs
         });
     }
 
     use futures::StreamExt;
-    let mut results = Vec::new();
-    while let Some(out) = tasks.next().await {
-        results.push(out);
+    while let Some(outs) = tasks.next().await {
+        results.extend(outs);
     }
 
     results.sort_by_key(|r| r.index);
@@ -261,6 +540,11 @@ async fn audit_batch(
         *state.batch_cancel.lock().unwrap() = None;
     }
 
+    // `pdf_tx` (and every row task's clone) is dropped here as the function
+    // returns. Once the last sender drops, the background worker drains
+    // whatever's left in the channel and exits on its own — it keeps running
+    // (and keeps emitting `batch-pdf-ready`) after this command has already
+    // resolved, which is the point: PDFs trail behind, they never gate it.
     Ok(results)
 }
 
@@ -268,6 +552,9 @@ async fn audit_batch(
 fn cancel_batch(state: State<'_, CrawlState>) {
     if let Some(token) = state.batch_cancel.lock().unwrap().as_ref() {
         token.cancel();
+    }
+    if let Some(h) = state.pdf_worker.lock().unwrap().take() {
+        h.abort();
     }
 }
 
@@ -384,6 +671,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(CrawlState::default())
         .invoke_handler(tauri::generate_handler![
             start_crawl,

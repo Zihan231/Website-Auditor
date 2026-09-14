@@ -21,6 +21,15 @@ export async function openExternal(url: string): Promise<void> {
   }
 }
 
+/** Let the user pick a folder via the native OS dialog. Returns the chosen
+ *  absolute path, or `null` if cancelled / unavailable outside Tauri. */
+export async function pickFolder(): Promise<string | null> {
+  if (!isTauri()) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({ directory: true, multiple: false });
+  return typeof selected === "string" ? selected : null;
+}
+
 /** Reflect the window's fullscreen state onto `<html data-fullscreen>` so CSS can
  *  drop the macOS traffic-light spacing in fullscreen. No-op in a browser. */
 export async function watchFullscreen(): Promise<() => void> {
@@ -279,13 +288,32 @@ export interface BatchRowOutput {
   websiteAudit: string;
   emailsFound: string[];
   status: "success" | "skipped" | "error";
+  /** Absolute path to this row's PDF report. Always null on the row's own
+   *  `batch-row-completed` event — PDF generation runs on a decoupled
+   *  background worker and arrives later via `onPdfReady`. */
+  pdfPath: string | null;
 }
 
+/** One row's PDF finished (or definitively failed) on the background worker —
+ *  fires independently of, and generally after, that row's completion. The
+ *  worker keeps running after `auditBatch`'s promise resolves, so callers
+ *  must listen via `listenForPdfEvents` (below), not inside `auditBatch`. */
+export interface BatchPdfReady {
+  index: number;
+  pdfPath: string | null;
+}
+
+/** `config` is a per-run template applied to every row (its own `url`/`mode`/
+ *  `urls` are ignored — each row re-targets a clone; see `config_for_row` on
+ *  the Rust side). `rowConcurrency` is a separate axis: how many *sites* run
+ *  in parallel, independent of `config.concurrency` (each site's own crawl).
+ *  `pdfDir` is the user-chosen PDF output folder (via `pickFolder`); `null`
+ *  falls back to Downloads. */
 export async function auditBatch(
   rows: BatchRowInput[],
-  maxPages: number,
-  timeoutSecs: number,
-  concurrency: number,
+  config: CrawlConfig,
+  rowConcurrency: number,
+  pdfDir: string | null,
   onRowCompleted: (row: BatchRowOutput) => void
 ): Promise<BatchRowOutput[]> {
   if (isTauri()) {
@@ -294,15 +322,35 @@ export async function auditBatch(
     try {
       return await invoke<BatchRowOutput[]>("audit_batch", {
         rows,
-        maxPages,
-        timeoutSecs,
-        concurrency,
+        config,
+        rowConcurrency,
+        pdfDirOverride: pdfDir,
       });
     } finally {
       un();
     }
   }
   return runBatchDemo(rows, onRowCompleted);
+}
+
+/** Listen for background PDF-report events. The PDF worker is decoupled from
+ *  the crawl and keeps running after `auditBatch` resolves — its whole point
+ *  is to trail behind without gating the audit — so this has its own
+ *  lifecycle: call once (e.g. in a mount effect) and keep it registered for
+ *  as long as PDFs might still be arriving, not just for one `auditBatch` call.
+ *  Returns a single teardown function for both listeners; no-ops outside Tauri. */
+export async function listenForPdfEvents(
+  onPdfReady: (update: BatchPdfReady) => void,
+  onPdfWarning: (message: string) => void
+): Promise<Unlisten> {
+  if (!isTauri()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  const unReady = await listen<BatchPdfReady>("batch-pdf-ready", (ev) => onPdfReady(ev.payload));
+  const unWarn = await listen<string>("batch-pdf-warning", (ev) => onPdfWarning(ev.payload));
+  return () => {
+    unReady();
+    unWarn();
+  };
 }
 
 export async function cancelBatch(): Promise<void> {
@@ -324,6 +372,7 @@ async function runBatchDemo(
           websiteAudit: `--- WEBSITE AUDIT REPORT ---\nSITE: ${row.website}\nSTATUS: Active (200 OK)\nPAGES_CRAWLED: 10\nOVERALL_SCORES:\n  Health: 85/100\n  GEO (AI-Search Readiness): 72/100\n  Accessibility (WCAG): 96/100\nTECHNICAL_HEALTH:\n  Avg Response Time: 240ms\n  SSL/HTTPS: Valid\n  Robots.txt: Found\n  Sitemap: Found\nSEO_FINDINGS:\n  Title Tags: All Present\n  Meta Descriptions: 1 Missing\n  Broken Links: 0\nEMAILS_DISCOVERED:\n  - contact@example.com`,
           emailsFound: ["contact@example.com"],
           status: "success",
+          pdfPath: null,
         }
       : {
           index: row.index,
@@ -332,6 +381,7 @@ async function runBatchDemo(
           websiteAudit: "no website",
           emailsFound: [],
           status: "skipped",
+          pdfPath: null,
         };
     onRowCompleted(out);
     results.push(out);

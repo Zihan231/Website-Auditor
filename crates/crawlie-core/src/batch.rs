@@ -1,13 +1,14 @@
 //! Batch site auditing and email enrichment for bulk CSV/Excel processing.
 
-use crate::crawler::{crawl, CancelToken};
+use crate::crawler::{crawl_with_renderer, CancelToken};
 use crate::knowledge::rule_info;
 use crate::priority::top_fixes;
+use crate::render::Renderer;
 use crate::timefmt::format_utc;
-use crate::types::{CrawlConfig, CrawlResult, Page, Severity};
+use crate::types::{Category, CrawlConfig, CrawlResult, Issue, Severity};
 use regex::Regex;
 use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use url::Url;
 
 static EMAIL_RE: OnceLock<Regex> = OnceLock::new();
@@ -125,31 +126,50 @@ pub struct BatchAuditOutcome {
     pub success: bool,
     pub report: String,
     pub emails: Vec<String>,
+    /// A short, plain-English HTML summary (`client_report::render`) sized
+    /// for handing straight to a client — not the detailed developer report.
+    /// `Some(..)` only when `generate_report_html` was requested and the
+    /// crawl succeeded — `None` otherwise, at zero extra cost.
+    pub report_html: Option<String>,
 }
 
-/// Run a crawl on a website bounded by `max_pages` and format the audit report.
-pub async fn audit_website_for_batch(
-    target_url: &str,
-    max_pages: usize,
-    timeout_secs: u64,
-    cancel: CancelToken,
-) -> BatchAuditOutcome {
-    let mut config = CrawlConfig::new(target_url);
-    config.max_pages = max_pages.clamp(1, 1000);
-    config.max_depth = 16;
-    config.timeout_secs = timeout_secs.clamp(3, 30);
-    config.concurrency = 12;
-    config.check_external = true;
-    config.use_sitemap = true;
-    config.respect_robots = true;
+/// Build a per-row [`CrawlConfig`] from a shared bulk-run template — same
+/// settings for every row (max pages/depth/concurrency, timeout, robots/
+/// sitemap/external-link/render toggles, user agent, exclusions), just
+/// re-targeted at `target_url`. Clamps `max_pages`/`timeout_secs` to sane
+/// bounds since these come from user-editable UI fields.
+pub fn config_for_row(template: &CrawlConfig, target_url: &str) -> CrawlConfig {
+    let mut config = template.clone();
+    config.url = target_url.to_string();
+    config.mode = crate::types::CrawlMode::Site;
+    config.urls = Vec::new();
+    config.max_pages = config.max_pages.clamp(1, 1000);
+    config.timeout_secs = config.timeout_secs.clamp(3, 30);
     config.resolve_host = true;
+    config
+}
 
-    match crawl(config, |_| {}, cancel).await {
+/// Run a crawl on a website using the given `config` (already targeted at
+/// this row's URL — see `config_for_row`) and format the audit report.
+/// `generate_report_html` additionally renders a short client-facing HTML
+/// summary (`client_report::render`) into `BatchAuditOutcome::report_html` —
+/// skip it when the caller has no use for it (e.g. PDF generation disabled) to avoid
+/// the extra rendering cost. `shared_renderer`, when `config.render` is on,
+/// reuses one already-running browser across every row in the batch instead
+/// of each row launching its own.
+pub async fn audit_website_for_batch(
+    config: CrawlConfig,
+    cancel: CancelToken,
+    generate_report_html: bool,
+    shared_renderer: Option<Arc<Renderer>>,
+) -> BatchAuditOutcome {
+    match crawl_with_renderer(config, |_| {}, cancel, shared_renderer).await {
         Err(e) => {
             BatchAuditOutcome {
                 success: false,
                 report: format!("Error: {e}"),
                 emails: Vec::new(),
+                report_html: None,
             }
         }
         Ok(result) => {
@@ -158,6 +178,7 @@ pub async fn audit_website_for_batch(
                     success: false,
                     report: "Error: No reachable pages found".to_string(),
                     emails: Vec::new(),
+                    report_html: None,
                 };
             }
 
@@ -168,6 +189,7 @@ pub async fn audit_website_for_batch(
                     success: false,
                     report: format!("Error: HTTP {}", root_page.status),
                     emails: Vec::new(),
+                    report_html: None,
                 };
             }
 
@@ -214,11 +236,17 @@ pub async fn audit_website_for_batch(
 
             // Format comprehensive human and AI readable audit report
             let report = format_audit_report(&result, &emails);
+            let report_html = if generate_report_html {
+                Some(crate::client_report::render(&result))
+            } else {
+                None
+            };
 
             BatchAuditOutcome {
                 success: true,
                 report,
                 emails,
+                report_html,
             }
         }
     }
@@ -392,152 +420,105 @@ pub fn format_audit_report(result: &CrawlResult, emails: &[String]) -> String {
     out.push('\n');
 
     // ==========================================
-    // 2. ISSUES PAGE DEEP DIVE
+    // 2. ISSUES PAGE — every rule that fired, full guidance
     // ==========================================
     out.push_str("=== ISSUES PAGE ===\n");
     out.push_str(&format!("Issues {}\n\n", result.issues.len()));
 
-    // 1. BROKEN LINKS DEEP DIVE
-    let broken_issues_count = result.issues.iter().filter(|i| i.rule == "broken-link").count();
-    if broken_issues_count > 0 || !result.broken_links.is_empty() {
-        let bl_info = rule_info("broken-link");
-        let pct = if total_pages > 0 {
-            ((result.broken_links.len() as f32 / total_pages as f32) * 100.0).round() as usize
-        } else {
-            0
-        };
-        out.push_str(&format!(
-            "Error\nBroken Link\n{}% of URLs\nLinks\n{}\n\n",
-            pct, broken_issues_count
-        ));
-        if let Some(info) = &bl_info {
-            out.push_str(&format!("Why it matters\n{}\n\n", info.why));
-            out.push_str(&format!("How to fix\n{}\n\n", info.how_to_fix));
-            out.push_str(&format!("If ignored\n{}\n\n", info.impact));
-        }
-        let unique_broken = result.broken_links.len();
-        out.push_str(&format!(
-            "{} unique broken URLs · {} occurrences\nStatus\tBroken URL\tUses\tPages\n",
-            unique_broken, broken_issues_count
-        ));
-        let mut sorted_broken = result.broken_links.clone();
-        sorted_broken.sort_by(|a, b| b.count.cmp(&a.count));
-        for bl in sorted_broken.iter().take(35) {
-            out.push_str(&format!(
-                "{}\t{}\t{}\t{}\n",
-                bl.status,
-                bl.url,
-                bl.count,
-                bl.sources.len()
-            ));
-        }
-        if sorted_broken.len() > 35 {
-            out.push_str(&format!(
-                "... and {} more unique broken URLs\n",
-                sorted_broken.len() - 35
-            ));
-        }
-        out.push('\n');
+    // Group every non-"good" finding by rule (one entry per rule × its
+    // affected issues), matching what the in-app Issues tab shows — not a
+    // curated top-N. Insertion order preserved via a parallel index map so
+    // ties fall back to first-seen order.
+    struct RuleGroup<'a> {
+        rule: &'a str,
+        title: &'a str,
+        category: Category,
+        severity: Severity,
+        items: Vec<&'a Issue>,
     }
-
-    // 2. CLIENT ERRORS (4xx) & SERVER ERRORS (5xx)
-    let error_pages: Vec<&Page> = result.pages.iter().filter(|p| p.status >= 400).collect();
-    if !error_pages.is_empty() {
-        let err_info = rule_info("client-error");
-        let err_pct = if total_pages > 0 {
-            ((error_pages.len() as f32 / total_pages as f32) * 100.0).round() as usize
-        } else {
-            0
-        };
-        out.push_str(&format!(
-            "Error\nClient Error (4xx)\n{}% of URLs\nResponse Codes\n{}\n\n",
-            err_pct, error_pages.len()
-        ));
-        if let Some(info) = &err_info {
-            out.push_str(&format!("Why it matters\n{}\n\n", info.why));
-            out.push_str(&format!("How to fix\n{}\n\n", info.how_to_fix));
-            out.push_str(&format!("If ignored\n{}\n\n", info.impact));
+    fn sev_rank(s: Severity) -> u8 {
+        match s {
+            Severity::Error => 3,
+            Severity::Warning => 2,
+            Severity::Notice => 1,
+            Severity::Good => 0,
         }
-        out.push_str("Status\tError Page URL\n");
-        for p in error_pages.iter().take(35) {
-            out.push_str(&format!("{}\t{}\n", p.status, p.url));
-        }
-        if error_pages.len() > 35 {
-            out.push_str(&format!(
-                "... and {} more error pages\n",
-                error_pages.len() - 35
-            ));
-        }
-        out.push('\n');
     }
-
-    // 3. BLOCKED BY ROBOTS.TXT
-    let robots_issues_count = result
-        .issues
-        .iter()
-        .filter(|i| i.rule == "robots-disallowed")
-        .count();
-    if robots_issues_count > 0 || !result.robots_blocked.is_empty() {
-        let count = if robots_issues_count > 0 {
-            robots_issues_count
-        } else {
-            result.robots_blocked.len()
-        };
-        let rob_info = rule_info("robots-disallowed");
-        out.push_str(&format!(
-            "Warning\nBlocked by robots.txt\nIndexability\n{}\n\n",
-            count
-        ));
-        if let Some(info) = &rob_info {
-            out.push_str(&format!("Why it matters\n{}\n\n", info.why));
-            out.push_str(&format!("How to fix\n{}\n\n", info.how_to_fix));
-            out.push_str(&format!("If ignored\n{}\n\n", info.impact));
-        }
-        if !result.robots_blocked.is_empty() {
-            out.push_str("Sample Blocked URLs:\n");
-            for u in result.robots_blocked.iter().take(10) {
-                out.push_str(&format!("- {}\n", u));
+    let mut groups: Vec<RuleGroup> = Vec::new();
+    {
+        let mut idx: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for issue in result.issues.iter().filter(|i| !matches!(i.severity, Severity::Good)) {
+            if let Some(&i) = idx.get(issue.rule.as_str()) {
+                groups[i].items.push(issue);
+            } else {
+                idx.insert(issue.rule.as_str(), groups.len());
+                groups.push(RuleGroup {
+                    rule: &issue.rule,
+                    title: &issue.title,
+                    category: issue.category,
+                    severity: issue.severity,
+                    items: vec![issue],
+                });
             }
         }
-        out.push('\n');
+    }
+    groups.sort_by(|a, b| {
+        sev_rank(b.severity)
+            .cmp(&sev_rank(a.severity))
+            .then(b.items.len().cmp(&a.items.len()))
+    });
+
+    if groups.is_empty() {
+        out.push_str("No issues found 🎉\n\n");
     }
 
-    // 4. IMAGES MISSING ALT TEXT
-    let missing_alt_count = result
-        .issues
-        .iter()
-        .filter(|i| i.rule == "image-missing-alt")
-        .count();
-    if missing_alt_count > 0 {
-        let alt_info = rule_info("image-missing-alt");
+    for g in &groups {
+        let affected = g.items.iter().map(|i| i.url.as_str()).collect::<HashSet<_>>().len();
+        let pct = if total_pages > 0 {
+            ((affected as f32 / total_pages as f32) * 100.0).round() as usize
+        } else {
+            0
+        };
         out.push_str(&format!(
-            "Warning\nImages Missing Alt Text\nImages\n{}\n\n",
-            missing_alt_count
+            "{}\n{}\n{}% of URLs\n{}\n{}\n\n",
+            g.severity.label(),
+            g.title,
+            pct,
+            g.category.label(),
+            g.items.len()
         ));
-        if let Some(info) = &alt_info {
+        if let Some(info) = rule_info(g.rule) {
             out.push_str(&format!("Why it matters\n{}\n\n", info.why));
             out.push_str(&format!("How to fix\n{}\n\n", info.how_to_fix));
             out.push_str(&format!("If ignored\n{}\n\n", info.impact));
         }
-        out.push('\n');
-    }
 
-    // 5. GEO: NO MACHINE-READABLE STRUCTURE
-    let geo_no_struct = result
-        .issues
-        .iter()
-        .filter(|i| i.rule == "geo-no-structure")
-        .count();
-    if geo_no_struct > 0 {
-        let geo_info = rule_info("geo-no-structure");
-        out.push_str(&format!(
-            "Warning\nGEO: No Machine-Readable Structure\nGenerative Engine Optimization\n{}\n\n",
-            geo_no_struct
-        ));
-        if let Some(info) = &geo_info {
-            out.push_str(&format!("Why it matters\n{}\n\n", info.why));
-            out.push_str(&format!("How to fix\n{}\n\n", info.how_to_fix));
-            out.push_str(&format!("If ignored\n{}\n\n", info.impact));
+        if g.rule == "broken-link" && !result.broken_links.is_empty() {
+            // Richer target-centric table: one row per dead target, not per occurrence.
+            let mut sorted_broken = result.broken_links.clone();
+            sorted_broken.sort_by(|a, b| b.count.cmp(&a.count));
+            out.push_str(&format!(
+                "{} unique broken URLs · {} occurrences\nStatus\tBroken URL\tUses\tPages\n",
+                sorted_broken.len(),
+                g.items.len()
+            ));
+            for bl in sorted_broken.iter().take(35) {
+                out.push_str(&format!("{}\t{}\t{}\t{}\n", bl.status, bl.url, bl.count, bl.sources.len()));
+            }
+            if sorted_broken.len() > 35 {
+                out.push_str(&format!("... and {} more unique broken URLs\n", sorted_broken.len() - 35));
+            }
+        } else {
+            out.push_str("Affected URLs:\n");
+            for i in g.items.iter().take(20) {
+                match &i.detail {
+                    Some(d) => out.push_str(&format!("- {}  [{}]\n", i.url, d)),
+                    None => out.push_str(&format!("- {}\n", i.url)),
+                }
+            }
+            if g.items.len() > 20 {
+                out.push_str(&format!("... and {} more\n", g.items.len() - 20));
+            }
         }
         out.push('\n');
     }

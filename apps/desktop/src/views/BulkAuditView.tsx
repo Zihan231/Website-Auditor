@@ -1,4 +1,4 @@
-import { useState, useRef, useMemo } from "react";
+import { useState, useRef, useMemo, useEffect } from "react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
 import {
@@ -15,15 +15,34 @@ import {
   ChevronRight,
   RefreshCw,
   Search,
+  FileText,
+  Folder,
+  X,
 } from "lucide-react";
 import {
   auditBatch,
   cancelBatch,
+  listenForPdfEvents,
+  openExternal,
+  pickFolder,
   type BatchRowInput,
   type BatchRowOutput,
 } from "../lib/api";
+import type { CrawlConfig, UrlFilter } from "../lib/types";
+import { DEFAULT_CONFIG } from "../lib/types";
+import { getCrawlDefaults } from "../lib/crawl-defaults";
+import { IconChevron, Toggle } from "../components/ui";
 
 type AuditStatus = "idle" | "running" | "done" | "cancelled";
+
+/** Split a textarea into one trimmed entry per line, as exclusion rules
+ *  (same convention as StartView's single-site crawl config). */
+const toFilters = (text: string, regex: boolean): UrlFilter[] =>
+  text
+    .split(/\n+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((value) => ({ value, regex }));
 
 export function BulkAuditView({ onBack }: { onBack?: () => void }) {
   const [fileName, setFileName] = useState<string>("");
@@ -33,13 +52,63 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
   const [websiteCol, setWebsiteCol] = useState<string>("");
   const [emailCol, setEmailCol] = useState<string>("");
 
-  const [maxPages, setMaxPages] = useState<number>(200);
-  const [concurrency, setConcurrency] = useState<number>(10);
-  const [timeoutSecs] = useState<number>(10);
+  // Full crawl config, shared by every row (each row just re-targets `url`)
+  // — same defaults and shape as the single-site audit's StartView.
+  const [cfg, setCfg] = useState<CrawlConfig>(() => ({ ...DEFAULT_CONFIG, ...getCrawlDefaults(), maxPages: 200 }));
+  const [rowConcurrency, setRowConcurrency] = useState<number>(10);
+  const [pdfDir, setPdfDir] = useState<string | null>(null);
+  const [advanced, setAdvanced] = useState(false);
+  const [hostsText, setHostsText] = useState("");
+  const [pathsText, setPathsText] = useState("");
+  const [hostsRegex, setHostsRegex] = useState(false);
+  const [pathsRegex, setPathsRegex] = useState(false);
+
+  const set = <K extends keyof CrawlConfig>(key: K, v: CrawlConfig[K]) => setCfg({ ...cfg, [key]: v });
+  const numField = (label: string, key: keyof CrawlConfig, min = 1) => (
+    <div className="field">
+      <label>{label}</label>
+      <input
+        className="input input-sm mono"
+        type="number"
+        min={min}
+        disabled={status === "running"}
+        value={cfg[key] as number}
+        onChange={(e) => set(key, Math.max(min, Number(e.target.value) || min) as CrawlConfig[typeof key])}
+      />
+    </div>
+  );
 
   const [status, setStatus] = useState<AuditStatus>("idle");
   const [results, setResults] = useState<Map<number, BatchRowOutput>>(new Map());
   const [currentProgress, setCurrentProgress] = useState<string>("");
+  const [pdfWarning, setPdfWarning] = useState<string | null>(null);
+
+  // PDF reports render on a background worker decoupled from the audit
+  // itself, so they keep arriving after a run finishes (or even after a new
+  // one starts) — listen for the whole lifetime of this view, not per-run.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    listenForPdfEvents(
+      (update) => {
+        setResults((prev) => {
+          const existing = prev.get(update.index);
+          if (!existing) return prev;
+          const next = new Map(prev);
+          next.set(update.index, { ...existing, pdfPath: update.pdfPath });
+          return next;
+        });
+      },
+      (message) => setPdfWarning(message)
+    ).then((un) => {
+      if (cancelled) un();
+      else unlisten = un;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
   const [searchFilter, setSearchFilter] = useState<string>("");
@@ -139,12 +208,18 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
       currentEmail: emailCol ? String(row[emailCol] || "") : undefined,
     }));
 
+    const finalConfig: CrawlConfig = {
+      ...cfg,
+      excludeHosts: toFilters(hostsText, hostsRegex),
+      excludePaths: toFilters(pathsText, pathsRegex),
+    };
+
     try {
       await auditBatch(
         batchInputs,
-        maxPages,
-        timeoutSecs,
-        concurrency,
+        finalConfig,
+        rowConcurrency,
+        pdfDir,
         (completedRow) => {
           setResults((prev) => {
             const next = new Map(prev);
@@ -184,6 +259,9 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
       // Add "website audit" column
       out["website audit"] = res ? res.websiteAudit : (row[websiteCol]?.trim() ? "Pending" : "no website");
 
+      // PDF report path \u2014 blank if still generating or unavailable for this row.
+      out["pdf report"] = res?.pdfPath || "";
+
       return out;
     });
 
@@ -202,6 +280,20 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
       URL.revokeObjectURL(url);
     } else {
       const ws = XLSX.utils.json_to_sheet(enrichedRows);
+
+      // Make the "pdf report" cells clickable links to the local PDF file.
+      const cols = Object.keys(enrichedRows[0] ?? {});
+      const pdfColIdx = cols.indexOf("pdf report");
+      if (pdfColIdx >= 0) {
+        enrichedRows.forEach((r, i) => {
+          const p = r["pdf report"];
+          if (!p) return;
+          const cellRef = XLSX.utils.encode_cell({ r: i + 1, c: pdfColIdx }); // +1: row 0 is the header
+          const fileUrl = "file:///" + encodeURI(String(p).replace(/\\/g, "/"));
+          if (ws[cellRef]) ws[cellRef].l = { Target: fileUrl, Tooltip: "Open PDF audit report" };
+        });
+      }
+
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "Enriched Data");
       XLSX.writeFile(wb, exportName);
@@ -217,6 +309,7 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
   let skippedCount = 0;
   let errorCount = 0;
   let newEmailsCount = 0;
+  let pdfReadyCount = 0;
 
   results.forEach((r) => {
     if (r.status === "success") successCount++;
@@ -225,6 +318,7 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
     if (r.emailsFound && r.emailsFound.length > 0) {
       newEmailsCount += r.emailsFound.length;
     }
+    if (r.pdfPath) pdfReadyCount++;
   });
 
   // Filtered rows for preview table
@@ -383,32 +477,13 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
 
               <div>
                 <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "var(--muted)", marginBottom: 6 }}>
-                  MAX PAGES PER SITE
+                  WEBSITES IN PARALLEL
                 </label>
                 <select
                   className="input"
-                  value={maxPages}
+                  value={rowConcurrency}
                   disabled={status === "running"}
-                  onChange={(e) => setMaxPages(Number(e.target.value))}
-                  style={{ width: "100%" }}
-                >
-                  <option value={25}>25 pages (Quick Sample)</option>
-                  <option value={50}>50 pages (Standard Crawl)</option>
-                  <option value={100}>100 pages (Deep Crawl)</option>
-                  <option value={200}>200 pages (Full Site Audit - Recommended)</option>
-                  <option value={500}>500 pages (Comprehensive Audit)</option>
-                </select>
-              </div>
-
-              <div>
-                <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "var(--muted)", marginBottom: 6 }}>
-                  CONCURRENT WORKERS
-                </label>
-                <select
-                  className="input"
-                  value={concurrency}
-                  disabled={status === "running"}
-                  onChange={(e) => setConcurrency(Number(e.target.value))}
+                  onChange={(e) => setRowConcurrency(Number(e.target.value))}
                   style={{ width: "100%" }}
                 >
                   <option value={5}>5 websites at once</option>
@@ -419,25 +494,164 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
               </div>
             </div>
 
-            {/* Audit Engine Features Badge Strip */}
-            <div
-              style={{
-                display: "flex",
-                flexWrap: "wrap",
-                gap: 12,
-                fontSize: 12,
-                color: "var(--muted)",
-                padding: "8px 12px",
-                background: "var(--bg)",
-                borderRadius: 8,
-                marginBottom: 16,
-              }}
-            >
-              <span style={{ color: "var(--green)", fontWeight: 500 }}>✓ Broken Link Checking (External & Internal)</span>
-              <span style={{ color: "var(--green)", fontWeight: 500 }}>✓ Sitemap.xml Seeding</span>
-              <span style={{ color: "var(--green)", fontWeight: 500 }}>✓ Robots.txt Verification</span>
-              <span style={{ color: "var(--green)", fontWeight: 500 }}>✓ Email & Contact Scraping</span>
-              <span style={{ color: "var(--green)", fontWeight: 500 }}>✓ Generative Engine (GEO) & Schema Audit</span>
+            {/* Per-site crawl settings — same fields/defaults as the single-site audit */}
+            <div className="config-grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 16, marginBottom: 16 }}>
+              {numField("Max pages", "maxPages")}
+              {numField("Max depth", "maxDepth", 0)}
+              {numField("Concurrency (per site)", "concurrency")}
+              {numField("Timeout (s)", "timeoutSecs")}
+            </div>
+
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "var(--muted)", marginBottom: 6 }}>
+                PDF REPORT FOLDER
+              </label>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  disabled={status === "running"}
+                  onClick={async () => {
+                    const dir = await pickFolder();
+                    if (dir) setPdfDir(dir);
+                  }}
+                >
+                  <Folder size={13} style={{ marginRight: 6 }} />
+                  Choose folder…
+                </button>
+                <span style={{ fontSize: 12, color: "var(--muted)", wordBreak: "break-all" }}>
+                  {pdfDir ?? "Downloads (default)"}
+                </span>
+                {pdfDir && (
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    disabled={status === "running"}
+                    title="Reset to default (Downloads)"
+                    onClick={() => setPdfDir(null)}
+                  >
+                    <X size={13} />
+                  </button>
+                )}
+              </div>
+              <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                All PDFs save directly here, one per site (named after its domain). Re-running a site overwrites its previous PDF with the latest report. Sites listed more than once in your spreadsheet are audited and PDF'd only once.
+              </span>
+            </div>
+
+            <div className="audit-toggles" style={{ display: "flex", flexWrap: "wrap", gap: 16, marginBottom: 16 }}>
+              <Toggle
+                on={cfg.checkExternal}
+                onChange={(v) => set("checkExternal", v)}
+                label="Verify external links"
+                hint="HEAD-check links that point off-site."
+              />
+              <Toggle on={cfg.respectRobots} onChange={(v) => set("respectRobots", v)} label="Respect robots.txt" />
+              <Toggle on={cfg.useSitemap} onChange={(v) => set("useSitemap", v)} label="Seed from sitemap" />
+              <Toggle
+                on={cfg.render}
+                onChange={(v) => set("render", v)}
+                label="Render JavaScript"
+                hint="Audit each page after headless Chrome runs its JS — for React, Vue & Next sites. Slower; needs Chrome / Chromium / Edge installed. One shared browser is used for the whole batch, not one per site."
+              />
+            </div>
+
+            <div className="audit-advanced" style={{ marginBottom: 16 }}>
+              <button
+                type="button"
+                className="disclosure"
+                onClick={() => setAdvanced(!advanced)}
+                style={{ display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", cursor: "pointer", padding: 0, color: "var(--muted)", fontSize: 13 }}
+              >
+                <span style={{ display: "inline-flex", transform: advanced ? "rotate(90deg)" : "none", transition: "transform 150ms" }}>
+                  <IconChevron size={14} />
+                </span>
+                Advanced — user agent & exclusions
+              </button>
+
+              {advanced && (
+                <div className="advanced-panel" style={{ marginTop: 12, display: "grid", gap: 16 }}>
+                  <div className="field">
+                    <label>User agent</label>
+                    <input
+                      className="input input-sm mono"
+                      style={{ width: "100%" }}
+                      disabled={status === "running"}
+                      value={cfg.userAgent}
+                      onChange={(e) => set("userAgent", e.target.value)}
+                      placeholder="crawlie/…"
+                    />
+                  </div>
+
+                  <div className="exclude-group">
+                    <div className="exclude-head" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <label>Excluded hosts</label>
+                      <label className="regex-inline" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--muted)" }}>
+                        Regex
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={hostsRegex}
+                          aria-label="Match hosts as regex"
+                          className={`switch sm${hostsRegex ? " on" : ""}`}
+                          disabled={status === "running"}
+                          onClick={() => setHostsRegex(!hostsRegex)}
+                        >
+                          <span className="knob" />
+                        </button>
+                      </label>
+                    </div>
+                    <textarea
+                      className="input mono"
+                      style={{ height: 70, padding: 10, resize: "vertical", width: "100%" }}
+                      disabled={status === "running"}
+                      placeholder={hostsRegex ? "^ads\\.\nfacebook\\.com$" : "twitter.com\nfacebook"}
+                      value={hostsText}
+                      onChange={(e) => setHostsText(e.target.value)}
+                    />
+                    <span className="tertiary exclude-hint" style={{ fontSize: 12, color: "var(--muted)" }}>
+                      One per line.{" "}
+                      {hostsRegex
+                        ? "Each line is a regular expression matched against the host."
+                        : "Substring match — “twitter” matches twitter.com and twitter.net."}
+                    </span>
+                  </div>
+
+                  <div className="exclude-group">
+                    <div className="exclude-head" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <label>Excluded paths</label>
+                      <label className="regex-inline" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--muted)" }}>
+                        Regex
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={pathsRegex}
+                          aria-label="Match paths as regex"
+                          className={`switch sm${pathsRegex ? " on" : ""}`}
+                          disabled={status === "running"}
+                          onClick={() => setPathsRegex(!pathsRegex)}
+                        >
+                          <span className="knob" />
+                        </button>
+                      </label>
+                    </div>
+                    <textarea
+                      className="input mono"
+                      style={{ height: 70, padding: 10, resize: "vertical", width: "100%" }}
+                      disabled={status === "running"}
+                      placeholder={pathsRegex ? "\\.php$\n^/cart" : "/share\n/cart"}
+                      value={pathsText}
+                      onChange={(e) => setPathsText(e.target.value)}
+                    />
+                    <span className="tertiary exclude-hint" style={{ fontSize: 12, color: "var(--muted)" }}>
+                      One per line.{" "}
+                      {pathsRegex
+                        ? "Each line is a regular expression matched against the URL path."
+                        : "Substring match — “/share” matches any path containing it."}
+                    </span>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Actions Bar */}
@@ -481,7 +695,7 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
           </div>
 
           {/* Progress & Metrics Dashboard */}
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 16, marginBottom: 24 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 16, marginBottom: 24 }}>
             <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "16px 20px" }}>
               <div style={{ fontSize: 12, color: "var(--muted)", fontWeight: 600 }}>TOTAL ROWS</div>
               <div style={{ fontSize: 24, fontWeight: 700, marginTop: 4 }}>{totalRows.toLocaleString()}</div>
@@ -510,7 +724,42 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
                 {newEmailsCount.toLocaleString()}
               </div>
             </div>
+            <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "16px 20px" }}>
+              <div style={{ fontSize: 12, color: "var(--muted)", fontWeight: 600 }}>PDFs READY</div>
+              <div style={{ fontSize: 24, fontWeight: 700, marginTop: 4, color: "var(--accent)" }}>
+                {pdfReadyCount.toLocaleString()} <span style={{ fontSize: 13, fontWeight: 400, color: "var(--muted)" }}>/ {successCount.toLocaleString()}</span>
+              </div>
+            </div>
           </div>
+
+          {/* PDF pipeline warning (missing browser, low disk space, ...) — one-time, dismissible */}
+          {pdfWarning && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "flex-start",
+                gap: 10,
+                background: "var(--amber-bg, #fef3c7)",
+                border: "1px solid var(--amber, #f59e0b)",
+                borderRadius: 10,
+                padding: "12px 16px",
+                marginBottom: 24,
+                fontSize: 13,
+                color: "var(--amber-text, #92400e)",
+              }}
+            >
+              <AlertCircle size={16} style={{ flexShrink: 0, marginTop: 1 }} />
+              <span style={{ flex: 1 }}>{pdfWarning}</span>
+              <button
+                className="icon-btn"
+                onClick={() => setPdfWarning(null)}
+                title="Dismiss"
+                style={{ color: "inherit" }}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          )}
 
           {/* Progress Bar */}
           {status === "running" && (
@@ -618,23 +867,42 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
                         <td style={{ padding: "12px 16px" }}>
                           {result ? (
                             <div>
-                              <div
-                                onClick={() => setExpandedIndex(isExpanded ? null : idx)}
-                                style={{
-                                  cursor: "pointer",
-                                  display: "flex",
-                                  alignItems: "center",
-                                  gap: 6,
-                                  color: "var(--accent)",
-                                  fontWeight: 500,
-                                }}
-                              >
-                                {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                                {result.status === "skipped"
-                                  ? "no website"
-                                  : result.status === "error"
-                                  ? result.websiteAudit
-                                  : "View Audit Summary"}
+                              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                                <div
+                                  onClick={() => setExpandedIndex(isExpanded ? null : idx)}
+                                  style={{
+                                    cursor: "pointer",
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: 6,
+                                    color: "var(--accent)",
+                                    fontWeight: 500,
+                                  }}
+                                >
+                                  {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                                  {result.status === "skipped"
+                                    ? "no website"
+                                    : result.status === "error"
+                                    ? result.websiteAudit
+                                    : "View Audit Summary"}
+                                </div>
+                                {result.status === "success" && (
+                                  result.pdfPath ? (
+                                    <button
+                                      className="btn btn-secondary btn-sm"
+                                      onClick={(e) => { e.stopPropagation(); void openExternal(result.pdfPath!); }}
+                                      title="Open PDF audit report"
+                                      style={{ padding: "2px 8px", fontSize: 12 }}
+                                    >
+                                      <FileText size={12} style={{ marginRight: 4 }} />
+                                      PDF
+                                    </button>
+                                  ) : (
+                                    <span style={{ color: "var(--muted)", fontSize: 12, fontStyle: "italic" }}>
+                                      Generating PDF…
+                                    </span>
+                                  )
+                                )}
                               </div>
                               {isExpanded && (
                                 <pre

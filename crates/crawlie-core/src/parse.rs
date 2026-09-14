@@ -334,8 +334,11 @@ fn collect_search_text(el: ElementRef, out: &mut String) {
 
 fn heading_level(name: &str) -> Option<u8> {
     let bytes = name.as_bytes();
-    (bytes.len() == 2 && bytes[0] == b'h' && (b'1'..=b'6').contains(&bytes[1]))
-        .then_some(bytes.get(1).copied().unwrap_or(b'0') - b'0')
+    if bytes.len() == 2 && bytes[0] == b'h' && (b'1'..=b'6').contains(&bytes[1]) {
+        Some(bytes[1] - b'0')
+    } else {
+        None
+    }
 }
 
 fn search_passages(root: ElementRef, breadcrumbs: &[String]) -> Vec<SearchSection> {
