@@ -30,6 +30,33 @@ export async function pickFolder(): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
+/** Let the user pick a destination path and filename via the native OS Save dialog.
+ *  Returns the chosen absolute path, or `null` if cancelled / unavailable outside Tauri. */
+export async function pickSavePath(options: {
+  defaultPath?: string;
+  filters?: { name: string; extensions: string[] }[];
+}): Promise<string | null> {
+  if (!isTauri()) return null;
+  const { save } = await import("@tauri-apps/plugin-dialog");
+  const selected = await save(options);
+  return typeof selected === "string" ? selected : null;
+}
+
+/** Save binary or text bytes to an absolute file path chosen by the user. */
+export async function saveFileBytes(path: string, bytes: Uint8Array | number[]): Promise<void> {
+  if (!isTauri()) return;
+  const data = bytes instanceof Uint8Array ? Array.from(bytes) : bytes;
+  await invoke("save_file_bytes", { path, data });
+}
+
+/** Reveal a file in the user's OS file explorer (Windows Explorer, macOS Finder). */
+export async function revealFileInFolder(path: string): Promise<void> {
+  if (isTauri()) {
+    const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+    await revealItemInDir(path);
+  }
+}
+
 /** Reflect the window's fullscreen state onto `<html data-fullscreen>` so CSS can
  *  drop the macOS traffic-light spacing in fullscreen. No-op in a browser. */
 export async function watchFullscreen(): Promise<() => void> {

@@ -177,6 +177,7 @@ const LIGHT_BLOCKED: &[&str] = &[
     "*googletagmanager.com/*", "*google-analytics.com/*", "*doubleclick.net/*",
     "*connect.facebook.net/*", "*static.hotjar.com/*", "*clarity.ms/*",
     "*cdn.segment.com/*", "*plausible.io/*",
+    "*ruxitagent*", "*dynatrace*", "*criteo*", "*amazon-adsystem*", "*adnxs.com*",
 ];
 
 #[cfg(feature = "render")]
@@ -254,7 +255,7 @@ mod real {
                     .unwrap_or(0),
             ));
 
-            let config = BrowserConfig::builder()
+            let mut builder = BrowserConfig::builder()
                 .chrome_executable(exe)
                 .user_data_dir(profile_dir)
                 .new_headless_mode()
@@ -264,7 +265,28 @@ mod real {
                 .arg("--no-sandbox")
                 .arg("--disable-gpu")
                 .arg("--disable-dev-shm-usage")
-                .build()?;
+                // Prevent third-party iframes (e.g. YouTube/Twitter embeds) from spawning
+                // their own dedicated renderer OS processes.
+                .arg("--disable-features=IsolateOrigins,site-per-process")
+                .arg("--disable-site-isolation-trials")
+                .arg("--mute-audio")
+                .arg("--no-first-run")
+                .arg("--no-default-browser-check")
+                // Hard-cap V8 JavaScript heap per renderer to 256MB so heavy sites (like Ulta)
+                // cannot expand heap to 1GB+ per tab and are forced to garbage collect.
+                .arg("--js-flags=--max-old-space-size=256")
+                // Restrict disk and media cache from consuming memory
+                .arg("--disk-cache-size=16777216")
+                .arg("--media-cache-size=16777216")
+                .arg("--disable-background-networking")
+                .arg("--disable-default-apps")
+                .arg("--disable-sync");
+
+            if let Some(limit) = max_tabs {
+                builder = builder.arg(format!("--renderer-process-limit={}", limit.max(1)));
+            }
+
+            let config = builder.build()?;
 
             let (browser, mut handler) = Browser::launch(config)
                 .await
@@ -281,11 +303,24 @@ mod real {
             })
         }
 
+        /// Forcefully close a page target at the browser level via CDP `Target.closeTarget`,
+        /// followed by `page.close()` to ensure sessions and OS renderer processes terminate.
+        async fn close_page_thoroughly(page: &chromiumoxide::page::Page) {
+            use chromiumoxide::cdp::browser_protocol::target::CloseTargetParams;
+            let target_id = page.target_id().clone();
+            let _ = tokio::time::timeout(
+                Duration::from_secs(3),
+                page.execute(CloseTargetParams::new(target_id)),
+            )
+            .await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), page.clone().close()).await;
+        }
+
         /// Render `url` and return its post-JavaScript serialized DOM plus lab
         /// Web Vitals and WCAG contrast results. `wait_ms` is an extra settle
         /// delay after navigation for late hydration; `custom_js` is an
         /// optional user snippet whose JSON-encoded result is captured. Always
-        /// closes the tab, even on error.
+        /// closes the tab, even on error or navigation timeout.
         ///
         /// `full` picks the render mode: `true` loads every resource and
         /// measures lab vitals; `false` is a "light" render — images, fonts,
@@ -306,20 +341,7 @@ mod real {
                 Some(sem) => Some(sem.acquire().await.map_err(|e| e.to_string())?),
                 None => None,
             };
-            let fut = self.render_inner(url, wait_ms, custom_js, full);
-            match tokio::time::timeout(self.nav_timeout, fut).await {
-                Ok(res) => res,
-                Err(_) => Err("render timed out".to_string()),
-            }
-        }
 
-        async fn render_inner(
-            &self,
-            url: &Url,
-            wait_ms: u64,
-            custom_js: Option<&str>,
-            full: bool,
-        ) -> Result<super::Rendered, String> {
             let page = if full {
                 self.browser
                     .new_page(url.as_str())
@@ -345,67 +367,80 @@ mod real {
                 page
             };
 
-            let nav = page.wait_for_navigation().await;
-            if wait_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-            }
-            let html = match nav {
-                Ok(p) => p.content().await,
-                // Navigation reported an error, but the DOM may still be usable
-                // (e.g. a slow sub-resource). Try to read it anyway.
-                Err(_) => page.content().await,
-            };
-            // Read buffered performance entries; failure is non-fatal.
-            #[derive(serde::Deserialize)]
-            struct Raw {
-                lcp: f64,
-                cls: f64,
-                fcp: f64,
-            }
-            let vitals = if !full {
-                None
-            } else {
-                match page.evaluate(super::VITALS_JS).await {
-                Ok(v) => v.into_value::<Raw>().ok().and_then(|r| {
-                    (r.lcp > 0.0 || r.fcp > 0.0 || r.cls > 0.0).then_some(crate::types::WebVitals {
-                        lcp_ms: r.lcp.round().max(0.0) as u32,
-                        cls: r.cls as f32,
-                        fcp_ms: r.fcp.round().max(0.0) as u32,
-                    })
-                }),
-                Err(_) => None,
+            let page_ref = &page;
+            let work = async {
+                let nav = page_ref.wait_for_navigation().await;
+                if wait_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                 }
-            };
-            // WCAG contrast walk over the live computed styles.
-            #[derive(serde::Deserialize)]
-            struct Contrast {
-                failures: usize,
-                checked: usize,
-            }
-            let contrast = match page.evaluate(super::CONTRAST_JS).await {
-                Ok(v) => v
-                    .into_value::<Contrast>()
-                    .ok()
-                    .filter(|c| c.checked > 0)
-                    .map(|c| (c.failures, c.checked)),
-                Err(_) => None,
-            };
-            // User-configured snippet; its JSON result is captured verbatim.
-            let custom = match custom_js {
-                Some(js) => match page.evaluate(js).await {
-                    Ok(v) => v.value().map(|j| j.to_string()),
+                let html = match nav {
+                    Ok(p) => p.content().await,
+                    // Navigation reported an error, but the DOM may still be usable
+                    // (e.g. a slow sub-resource). Try to read it anyway.
+                    Err(_) => page_ref.content().await,
+                };
+                // Read buffered performance entries; failure is non-fatal.
+                #[derive(serde::Deserialize)]
+                struct Raw {
+                    lcp: f64,
+                    cls: f64,
+                    fcp: f64,
+                }
+                let vitals = if !full {
+                    None
+                } else {
+                    match page_ref.evaluate(super::VITALS_JS).await {
+                        Ok(v) => v.into_value::<Raw>().ok().and_then(|r| {
+                            (r.lcp > 0.0 || r.fcp > 0.0 || r.cls > 0.0).then_some(crate::types::WebVitals {
+                                lcp_ms: r.lcp.round().max(0.0) as u32,
+                                cls: r.cls as f32,
+                                fcp_ms: r.fcp.round().max(0.0) as u32,
+                            })
+                        }),
+                        Err(_) => None,
+                    }
+                };
+                // WCAG contrast walk over the live computed styles.
+                #[derive(serde::Deserialize)]
+                struct Contrast {
+                    failures: usize,
+                    checked: usize,
+                }
+                let contrast = match page_ref.evaluate(super::CONTRAST_JS).await {
+                    Ok(v) => v
+                        .into_value::<Contrast>()
+                        .ok()
+                        .filter(|c| c.checked > 0)
+                        .map(|c| (c.failures, c.checked)),
                     Err(_) => None,
-                },
-                None => None,
+                };
+                // User-configured snippet; its JSON result is captured verbatim.
+                let custom = match custom_js {
+                    Some(js) => match page_ref.evaluate(js).await {
+                        Ok(v) => v.value().map(|j| j.to_string()),
+                        Err(_) => None,
+                    },
+                    None => None,
+                };
+
+                html.map(|html| super::Rendered {
+                    html,
+                    vitals,
+                    contrast,
+                    custom,
+                })
+                .map_err(|e| format!("could not read rendered DOM: {e}"))
             };
-            let _ = page.close().await;
-            html.map(|html| super::Rendered {
-                html,
-                vitals,
-                contrast,
-                custom,
-            })
-            .map_err(|e| format!("could not read rendered DOM: {e}"))
+
+            let res = match tokio::time::timeout(self.nav_timeout, work).await {
+                Ok(res) => res,
+                Err(_) => Err("render timed out".to_string()),
+            };
+
+            // Guaranteed tab closure even if navigation or evaluation timed out
+            Self::close_page_thoroughly(&page).await;
+
+            res
         }
     }
 
@@ -420,28 +455,35 @@ mod real {
                 Some(sem) => Some(sem.acquire().await.map_err(|e| e.to_string())?),
                 None => None,
             };
-            let fut = async {
-                let page = self
-                    .browser
-                    .new_page(url.as_str())
-                    .await
-                    .map_err(|e| format!("new tab failed: {e}"))?;
-                let _ = page.wait_for_navigation().await;
+
+            let page = self
+                .browser
+                .new_page(url.as_str())
+                .await
+                .map_err(|e| format!("new tab failed: {e}"))?;
+
+            let page_ref = &page;
+            let work = async {
+                let _ = page_ref.wait_for_navigation().await;
                 let params = PrintToPdfParams {
                     print_background: Some(true),
                     ..Default::default()
                 };
-                let bytes = page
+                page_ref
                     .pdf(params)
                     .await
-                    .map_err(|e| format!("print to PDF failed: {e}"));
-                let _ = page.close().await;
-                bytes
+                    .map_err(|e| format!("print to PDF failed: {e}"))
             };
-            match tokio::time::timeout(self.nav_timeout, fut).await {
+
+            let res = match tokio::time::timeout(self.nav_timeout, work).await {
                 Ok(res) => res,
                 Err(_) => Err("PDF render timed out".to_string()),
-            }
+            };
+
+            // Guaranteed tab closure even if PDF rendering timed out
+            Self::close_page_thoroughly(&page).await;
+
+            res
         }
     }
 

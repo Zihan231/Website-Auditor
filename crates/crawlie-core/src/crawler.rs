@@ -464,8 +464,16 @@ where
     };
     // Lab-vitals sampling (render mode): the first N rendered pages load full
     // resources and measure vitals; the rest render light. See CrawlConfig.
-    let vitals_budget = (config.render && config.vitals_sample_pages > 0)
-        .then(|| Arc::new(AtomicUsize::new(config.vitals_sample_pages)));
+    // In shared-renderer mode (bulk audit), vitals are not evaluated so pages
+    // render light — blocking heavy image bitmaps, fonts and media to keep memory low.
+    let is_shared = shared_renderer.is_some();
+    let vitals_budget = if is_shared {
+        Some(Arc::new(AtomicUsize::new(0)))
+    } else if config.render && config.vitals_sample_pages > 0 {
+        Some(Arc::new(AtomicUsize::new(config.vitals_sample_pages)))
+    } else {
+        None
+    };
 
     let concurrency = config.concurrency.max(1);
     let follow = matches!(config.mode, CrawlMode::Site);

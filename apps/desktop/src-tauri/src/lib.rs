@@ -164,7 +164,7 @@ struct PdfReady {
 /// each opening up to `config.concurrency` tabs for its own pages, multiply
 /// unchecked (e.g. 25 rows × 16 = 400+ tabs, several GB of RAM). Deliberately
 /// independent of, and much smaller than, either concurrency slider.
-const MAX_SHARED_RENDERER_TABS: usize = 6;
+const MAX_SHARED_RENDERER_TABS: usize = 3;
 /// Conservative per-PDF size estimate for the disk-space preflight check.
 /// Recalibrate from real batches once there's field data.
 const ESTIMATED_PDF_BYTES: u64 = 1_500_000;
@@ -666,6 +666,17 @@ fn save_html_report(app: AppHandle, result: CrawlResult) -> Result<String, Strin
     Ok(path.to_string_lossy().to_string())
 }
 
+/// Write arbitrary binary or text bytes to an absolute path chosen by the user
+/// via the native Save dialog. Creates parent directories if needed.
+#[tauri::command]
+fn save_file_bytes(path: String, data: Vec<u8>) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(p, data).map_err(|e| e.to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -683,6 +694,7 @@ pub fn run() {
             delete_report,
             diff_reports,
             save_html_report,
+            save_file_bytes,
             get_settings,
             set_settings,
             auth_load,

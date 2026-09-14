@@ -549,6 +549,14 @@ pub fn format_audit_report(result: &CrawlResult, emails: &[String]) -> String {
         }
     }
 
+    // Excel and standard spreadsheet formats enforce a strict limit of 32,767 characters per cell.
+    // Cap long audit reports to 31,800 chars so cells never break spreadsheet parsers or throw limits.
+    if out.chars().count() > 32_000 {
+        let mut truncated: String = out.chars().take(31_800).collect();
+        truncated.push_str("\n\n[... Remaining findings truncated for spreadsheet cell limit (32,767 chars). Full report available in the PDF report.]\n");
+        return truncated;
+    }
+
     out
 }
 

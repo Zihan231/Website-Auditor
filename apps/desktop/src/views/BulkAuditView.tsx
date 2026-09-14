@@ -22,9 +22,13 @@ import {
 import {
   auditBatch,
   cancelBatch,
+  isTauri,
   listenForPdfEvents,
   openExternal,
   pickFolder,
+  pickSavePath,
+  revealFileInFolder,
+  saveFileBytes,
   type BatchRowInput,
   type BatchRowOutput,
 } from "../lib/api";
@@ -43,6 +47,18 @@ const toFilters = (text: string, regex: boolean): UrlFilter[] =>
     .map((s) => s.trim())
     .filter(Boolean)
     .map((value) => ({ value, regex }));
+
+const EXCEL_MAX_CELL_CHARS = 32000;
+
+function truncateCellForSpreadsheet(val: unknown): unknown {
+  if (typeof val === "string" && val.length > EXCEL_MAX_CELL_CHARS) {
+    return (
+      val.slice(0, EXCEL_MAX_CELL_CHARS - 120) +
+      "\n\n[... Truncated: Exceeded Excel 32,767 character-per-cell limit. See full audit in the generated PDF report.]"
+    );
+  }
+  return val;
+}
 
 export function BulkAuditView({ onBack }: { onBack?: () => void }) {
   const [fileName, setFileName] = useState<string>("");
@@ -82,6 +98,9 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
   const [results, setResults] = useState<Map<number, BatchRowOutput>>(new Map());
   const [currentProgress, setCurrentProgress] = useState<string>("");
   const [pdfWarning, setPdfWarning] = useState<string | null>(null);
+  const [exportingFormat, setExportingFormat] = useState<"csv" | "xlsx" | null>(null);
+  const [exportSuccessMsg, setExportSuccessMsg] = useState<{ path: string; format: string } | null>(null);
+  const [exportErrorMsg, setExportErrorMsg] = useState<string | null>(null);
 
   // PDF reports render on a background worker decoupled from the audit
   // itself, so they keep arriving after a run finishes (or even after a new
@@ -244,59 +263,118 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
   };
 
   // Export Enriched File
-  const handleExport = (format: "csv" | "xlsx") => {
-    if (rows.length === 0) return;
+  const handleExport = async (format: "csv" | "xlsx") => {
+    if (rows.length === 0 || exportingFormat !== null) return;
 
-    const enrichedRows = rows.map((row, idx) => {
-      const res = results.get(idx);
-      const out = { ...row };
+    setExportErrorMsg(null);
+    setExportSuccessMsg(null);
 
-      // Update email column
-      if (emailCol) {
-        out[emailCol] = res ? res.updatedEmail : (row[emailCol] || "");
-      }
+    const baseName = fileName.replace(/\.[^/.]+$/, "") || "audit-leads";
+    const defaultExportName = `${baseName}-enriched.${format}`;
 
-      // Add "website audit" column
-      out["website audit"] = res ? res.websiteAudit : (row[websiteCol]?.trim() ? "Pending" : "no website");
-
-      // PDF report path \u2014 blank if still generating or unavailable for this row.
-      out["pdf report"] = res?.pdfPath || "";
-
-      return out;
-    });
-
-    const baseName = fileName.replace(/\.[^/.]+$/, "");
-    const exportName = `${baseName}-enriched.${format}`;
-
-    if (format === "csv") {
-      // Include UTF-8 BOM so Excel opens special characters correctly
-      const csvStr = "\uFEFF" + Papa.unparse(enrichedRows);
-      const blob = new Blob([csvStr], { type: "text/csv;charset=utf-8;" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = exportName;
-      a.click();
-      URL.revokeObjectURL(url);
-    } else {
-      const ws = XLSX.utils.json_to_sheet(enrichedRows);
-
-      // Make the "pdf report" cells clickable links to the local PDF file.
-      const cols = Object.keys(enrichedRows[0] ?? {});
-      const pdfColIdx = cols.indexOf("pdf report");
-      if (pdfColIdx >= 0) {
-        enrichedRows.forEach((r, i) => {
-          const p = r["pdf report"];
-          if (!p) return;
-          const cellRef = XLSX.utils.encode_cell({ r: i + 1, c: pdfColIdx }); // +1: row 0 is the header
-          const fileUrl = "file:///" + encodeURI(String(p).replace(/\\/g, "/"));
-          if (ws[cellRef]) ws[cellRef].l = { Target: fileUrl, Tooltip: "Open PDF audit report" };
+    // 1. If running inside Tauri desktop app, prompt the user with native Save-As dialog
+    let savePath: string | null = null;
+    if (isTauri()) {
+      try {
+        savePath = await pickSavePath({
+          defaultPath: defaultExportName,
+          filters:
+            format === "csv"
+              ? [{ name: "CSV (Comma delimited)", extensions: ["csv"] }]
+              : [{ name: "Excel Spreadsheet", extensions: ["xlsx"] }],
         });
+      } catch (err) {
+        setExportErrorMsg(`Could not open save dialog: ${String(err)}`);
+        return;
       }
 
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, "Enriched Data");
-      XLSX.writeFile(wb, exportName);
+      // User cancelled the file picker dialog
+      if (!savePath) {
+        return;
+      }
+    }
+
+    setExportingFormat(format);
+
+    try {
+      const enrichedRows = rows.map((row, idx) => {
+        const res = results.get(idx);
+        const out = { ...row };
+
+        // Update email column
+        if (emailCol) {
+          out[emailCol] = res ? res.updatedEmail : (row[emailCol] || "");
+        }
+
+        // Add "website audit" column (safely truncated to fit spreadsheet cell limits)
+        const auditText = res ? res.websiteAudit : (row[websiteCol]?.trim() ? "Pending" : "no website");
+        out["website audit"] = truncateCellForSpreadsheet(auditText);
+
+        // PDF report path — blank if still generating or unavailable for this row.
+        out["pdf report"] = res?.pdfPath || "";
+
+        return out;
+      });
+
+      if (format === "csv") {
+        // Include UTF-8 BOM so Excel opens special characters correctly
+        const csvStr = "\uFEFF" + Papa.unparse(enrichedRows);
+
+        if (isTauri() && savePath) {
+          const bytes = new TextEncoder().encode(csvStr);
+          await saveFileBytes(savePath, bytes);
+          setExportSuccessMsg({ path: savePath, format: "CSV" });
+        } else {
+          const blob = new Blob([csvStr], { type: "text/csv;charset=utf-8;" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = defaultExportName;
+          a.click();
+          URL.revokeObjectURL(url);
+          setExportSuccessMsg({ path: defaultExportName, format: "CSV" });
+        }
+      } else {
+        // Double-check all columns so SheetJS never encounters any cell string > 32,767 characters
+        const sanitizedRows = enrichedRows.map((row) => {
+          const clean: Record<string, any> = {};
+          for (const [key, value] of Object.entries(row)) {
+            clean[key] = truncateCellForSpreadsheet(value);
+          }
+          return clean;
+        });
+
+        const ws = XLSX.utils.json_to_sheet(sanitizedRows);
+
+        // Make the "pdf report" cells clickable links to the local PDF file.
+        const cols = Object.keys(enrichedRows[0] ?? {});
+        const pdfColIdx = cols.indexOf("pdf report");
+        if (pdfColIdx >= 0) {
+          enrichedRows.forEach((r, i) => {
+            const p = r["pdf report"];
+            if (!p) return;
+            const cellRef = XLSX.utils.encode_cell({ r: i + 1, c: pdfColIdx }); // +1: row 0 is the header
+            const fileUrl = "file:///" + encodeURI(String(p).replace(/\\/g, "/"));
+            if (ws[cellRef]) ws[cellRef].l = { Target: fileUrl, Tooltip: "Open PDF audit report" };
+          });
+        }
+
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "Enriched Data");
+
+        if (isTauri() && savePath) {
+          const buffer = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+          await saveFileBytes(savePath, new Uint8Array(buffer));
+          setExportSuccessMsg({ path: savePath, format: "Excel" });
+        } else {
+          XLSX.writeFile(wb, defaultExportName);
+          setExportSuccessMsg({ path: defaultExportName, format: "Excel" });
+        }
+      }
+    } catch (err) {
+      setExportErrorMsg(`Export failed: ${String(err)}`);
+    } finally {
+      setExportingFormat(null);
     }
   };
 
@@ -674,24 +752,119 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
               <div style={{ display: "flex", gap: 10 }}>
                 <button
                   className="btn btn-secondary"
-                  disabled={processedCount === 0}
+                  disabled={processedCount === 0 || exportingFormat !== null}
                   onClick={() => handleExport("csv")}
-                  title="Download enriched CSV with new emails and website audit"
+                  title="Choose path and save enriched CSV"
                 >
-                  <Download size={14} style={{ marginRight: 6 }} />
-                  Download CSV
+                  {exportingFormat === "csv" ? (
+                    <>
+                      <RefreshCw size={14} style={{ animation: "spin 1s linear infinite", marginRight: 6 }} />
+                      Saving CSV…
+                    </>
+                  ) : (
+                    <>
+                      <Download size={14} style={{ marginRight: 6 }} />
+                      Download CSV
+                    </>
+                  )}
                 </button>
                 <button
                   className="btn btn-secondary"
-                  disabled={processedCount === 0}
+                  disabled={processedCount === 0 || exportingFormat !== null}
                   onClick={() => handleExport("xlsx")}
-                  title="Download enriched Excel (.xlsx) file"
+                  title="Choose path and save enriched Excel (.xlsx) file"
                 >
-                  <Download size={14} style={{ marginRight: 6 }} />
-                  Download Excel (.xlsx)
+                  {exportingFormat === "xlsx" ? (
+                    <>
+                      <RefreshCw size={14} style={{ animation: "spin 1s linear infinite", marginRight: 6 }} />
+                      Saving Excel…
+                    </>
+                  ) : (
+                    <>
+                      <Download size={14} style={{ marginRight: 6 }} />
+                      Download Excel (.xlsx)
+                    </>
+                  )}
                 </button>
               </div>
             </div>
+
+            {/* Export Feedback Banners */}
+            {exportSuccessMsg && (
+              <div
+                style={{
+                  marginTop: 14,
+                  padding: "10px 14px",
+                  borderRadius: 8,
+                  background: "rgba(34, 197, 94, 0.12)",
+                  border: "1px solid rgba(34, 197, 94, 0.3)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 12,
+                  fontSize: 13,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 8, overflow: "hidden" }}>
+                  <CheckCircle2 size={16} style={{ color: "var(--good, #22c55e)", flexShrink: 0 }} />
+                  <span style={{ color: "var(--foreground)", textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap" }}>
+                    <strong>{exportSuccessMsg.format} file saved:</strong> {exportSuccessMsg.path}
+                  </span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+                  {isTauri() && (
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      style={{ fontSize: 12, padding: "4px 10px" }}
+                      onClick={() => revealFileInFolder(exportSuccessMsg.path)}
+                    >
+                      Show in Folder
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    style={{ padding: 4, background: "transparent", border: "none", cursor: "pointer", color: "var(--muted)" }}
+                    onClick={() => setExportSuccessMsg(null)}
+                    title="Dismiss"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {exportErrorMsg && (
+              <div
+                style={{
+                  marginTop: 14,
+                  padding: "10px 14px",
+                  borderRadius: 8,
+                  background: "rgba(239, 68, 68, 0.12)",
+                  border: "1px solid rgba(239, 68, 68, 0.3)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 12,
+                  fontSize: 13,
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <AlertCircle size={16} style={{ color: "var(--error, #ef4444)", flexShrink: 0 }} />
+                  <span style={{ color: "var(--foreground)" }}>{exportErrorMsg}</span>
+                </div>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  style={{ padding: 4, background: "transparent", border: "none", cursor: "pointer", color: "var(--muted)" }}
+                  onClick={() => setExportErrorMsg(null)}
+                  title="Dismiss"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Progress & Metrics Dashboard */}
