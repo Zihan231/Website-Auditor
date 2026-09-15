@@ -336,11 +336,16 @@ export interface BatchPdfReady {
  *  in parallel, independent of `config.concurrency` (each site's own crawl).
  *  `pdfDir` is the user-chosen PDF output folder (via `pickFolder`); `null`
  *  falls back to Downloads. */
+/** `maxRamMb` is a cooperative ceiling on this app's whole process tree
+ *  (itself + every Chrome/Edge helper it spawns) — once hit, new site audits
+ *  pause until usage drops back down; nothing already running is interrupted.
+ *  Not a hard OS-enforced limit. Pass `0` to disable the guard entirely. */
 export async function auditBatch(
   rows: BatchRowInput[],
   config: CrawlConfig,
   rowConcurrency: number,
   pdfDir: string | null,
+  maxRamMb: number,
   onRowCompleted: (row: BatchRowOutput) => void
 ): Promise<BatchRowOutput[]> {
   if (isTauri()) {
@@ -352,6 +357,7 @@ export async function auditBatch(
         config,
         rowConcurrency,
         pdfDirOverride: pdfDir,
+        maxRamMb,
       });
     } finally {
       un();

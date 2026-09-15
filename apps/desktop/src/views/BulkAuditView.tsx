@@ -17,6 +17,7 @@ import {
   Search,
   FileText,
   Folder,
+  Pause,
   X,
 } from "lucide-react";
 import {
@@ -37,7 +38,13 @@ import { DEFAULT_CONFIG } from "../lib/types";
 import { getCrawlDefaults } from "../lib/crawl-defaults";
 import { IconChevron, Toggle } from "../components/ui";
 
-type AuditStatus = "idle" | "running" | "done" | "cancelled";
+type AuditStatus = "idle" | "running" | "done" | "cancelled" | "paused";
+
+/** Marks a row as interrupted by a user pause (vs. a genuine per-site error)
+ *  so Resume knows which rows to retry. Same string `cancel_batch` already
+ *  produces for an in-flight row — pausing just reuses that primitive and
+ *  gives the result a different status label in the UI. */
+const PAUSED_MARKER = "Error: Cancelled";
 
 /** Split a textarea into one trimmed entry per line, as exclusion rules
  *  (same convention as StartView's single-site crawl config). */
@@ -73,6 +80,10 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
   const [cfg, setCfg] = useState<CrawlConfig>(() => ({ ...DEFAULT_CONFIG, ...getCrawlDefaults(), maxPages: 200 }));
   const [rowConcurrency, setRowConcurrency] = useState<number>(10);
   const [pdfDir, setPdfDir] = useState<string | null>(null);
+  // Cooperative RAM ceiling for the whole app (itself + every Chrome/Edge tab
+  // it opens) — 0 disables the guard. 1500 MB is a safe default for a
+  // machine also running a normal browser session alongside crawlie.
+  const [maxRamMb, setMaxRamMb] = useState<number>(1500);
   const [advanced, setAdvanced] = useState(false);
   const [hostsText, setHostsText] = useState("");
   const [pathsText, setPathsText] = useState("");
@@ -210,7 +221,41 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
     }
   };
 
-  // Start Batch Audit
+  // Runs `batchInputs` through the backend, merging completions into the
+  // existing `results` map (never resetting it) — shared by a fresh start
+  // and a resume, which differ only in which rows they hand in.
+  const runBatch = async (batchInputs: BatchRowInput[], totalForProgress: number) => {
+    const finalConfig: CrawlConfig = {
+      ...cfg,
+      excludeHosts: toFilters(hostsText, hostsRegex),
+      excludePaths: toFilters(pathsText, pathsRegex),
+    };
+
+    try {
+      await auditBatch(
+        batchInputs,
+        finalConfig,
+        rowConcurrency,
+        pdfDir,
+        maxRamMb,
+        (completedRow) => {
+          setResults((prev) => {
+            const next = new Map(prev);
+            next.set(completedRow.index, completedRow);
+            return next;
+          });
+          setCurrentProgress(`Processed row ${completedRow.index + 1} of ${totalForProgress} (${completedRow.website || "no website"})`);
+        }
+      );
+      setStatus("done");
+      setCurrentProgress("Audit complete!");
+    } catch (err) {
+      setStatus("done");
+      setCurrentProgress(`Batch ended: ${String(err)}`);
+    }
+  };
+
+  // Start Batch Audit (fresh run — clears any previous results)
   const handleStart = async () => {
     if (!websiteCol) {
       alert("Please select the column that contains the website URLs.");
@@ -227,35 +272,45 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
       currentEmail: emailCol ? String(row[emailCol] || "") : undefined,
     }));
 
-    const finalConfig: CrawlConfig = {
-      ...cfg,
-      excludeHosts: toFilters(hostsText, hostsRegex),
-      excludePaths: toFilters(pathsText, pathsRegex),
-    };
-
-    try {
-      await auditBatch(
-        batchInputs,
-        finalConfig,
-        rowConcurrency,
-        pdfDir,
-        (completedRow) => {
-          setResults((prev) => {
-            const next = new Map(prev);
-            next.set(completedRow.index, completedRow);
-            return next;
-          });
-          setCurrentProgress(`Processed row ${completedRow.index + 1} of ${batchInputs.length} (${completedRow.website || "no website"})`);
-        }
-      );
-      setStatus("done");
-      setCurrentProgress("Audit complete!");
-    } catch (err) {
-      setStatus("done");
-      setCurrentProgress(`Batch ended: ${String(err)}`);
-    }
+    await runBatch(batchInputs, batchInputs.length);
   };
 
+  // Pause: stops the in-flight run (same backend call as Cancel) but keeps
+  // every result gathered so far and offers Resume instead of a reset.
+  const handlePause = async () => {
+    await cancelBatch();
+    setStatus("paused");
+    setCurrentProgress("Paused — click Resume to continue from where you left off.");
+  };
+
+  // Resume: re-sends only rows that never finished (never started, or were
+  // cut short by the pause) — already-completed rows are left untouched in
+  // `results`, so nothing gets audited twice.
+  const handleResume = async () => {
+    const remaining: BatchRowInput[] = rows
+      .map((row, idx) => ({
+        index: idx,
+        website: String(row[websiteCol] || ""),
+        currentEmail: emailCol ? String(row[emailCol] || "") : undefined,
+      }))
+      .filter((row) => {
+        const existing = results.get(row.index);
+        return !existing || (existing.status === "error" && existing.websiteAudit === PAUSED_MARKER);
+      });
+
+    if (remaining.length === 0) {
+      setStatus("done");
+      setCurrentProgress("Audit complete!");
+      return;
+    }
+
+    setStatus("running");
+    setCurrentProgress(`Resuming — ${remaining.length} row${remaining.length === 1 ? "" : "s"} left...`);
+    await runBatch(remaining, rows.length);
+  };
+
+  // Stop / Cancel: a full stop. Unlike Pause, there's no expectation of
+  // resuming — "Re-Run Audit" starts over from scratch instead.
   const handleCancel = async () => {
     await cancelBatch();
     setStatus("cancelled");
@@ -570,6 +625,23 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
                   <option value={25}>25 websites at once (Turbo)</option>
                 </select>
               </div>
+
+              <div>
+                <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "var(--muted)", marginBottom: 6 }}>
+                  MAX RAM (MB)
+                </label>
+                <input
+                  type="number"
+                  className="input"
+                  min={0}
+                  step={100}
+                  value={maxRamMb}
+                  disabled={status === "running"}
+                  onChange={(e) => setMaxRamMb(Math.max(0, Number(e.target.value) || 0))}
+                  style={{ width: "100%" }}
+                  title="Pauses starting new site audits once this app's total memory usage (itself + every Chrome/Edge tab it opens) reaches this limit. In-progress audits are never interrupted. Set to 0 to disable."
+                />
+              </div>
             </div>
 
             {/* Per-site crawl settings — same fields/defaults as the single-site audit */}
@@ -735,15 +807,34 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
             {/* Actions Bar */}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingTop: 16, borderTop: "1px solid var(--border)" }}>
               <div style={{ display: "flex", gap: 12 }}>
-                {status !== "running" ? (
+                {status === "running" && (
+                  <>
+                    <button className="btn btn-secondary" onClick={handlePause}>
+                      <Pause size={14} style={{ marginRight: 6 }} />
+                      Pause
+                    </button>
+                    <button className="btn btn-danger" onClick={handleCancel}>
+                      <Square size={14} style={{ marginRight: 6 }} />
+                      Stop / Cancel
+                    </button>
+                  </>
+                )}
+                {status === "paused" && (
+                  <>
+                    <button className="btn btn-primary" onClick={handleResume}>
+                      <Play size={15} style={{ marginRight: 6 }} />
+                      Resume
+                    </button>
+                    <button className="btn btn-danger" onClick={handleCancel}>
+                      <Square size={14} style={{ marginRight: 6 }} />
+                      Stop / Cancel
+                    </button>
+                  </>
+                )}
+                {status !== "running" && status !== "paused" && (
                   <button className="btn btn-primary" onClick={handleStart}>
                     <Play size={15} style={{ marginRight: 6 }} />
-                    {status === "done" ? "Re-Run Audit" : "Start Bulk Audit"}
-                  </button>
-                ) : (
-                  <button className="btn btn-danger" onClick={handleCancel}>
-                    <Square size={14} style={{ marginRight: 6 }} />
-                    Stop / Cancel
+                    {status === "done" || status === "cancelled" ? "Re-Run Audit" : "Start Bulk Audit"}
                   </button>
                 )}
               </div>

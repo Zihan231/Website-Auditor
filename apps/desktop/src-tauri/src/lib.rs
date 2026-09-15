@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Default)]
@@ -172,6 +173,37 @@ const ESTIMATED_PDF_BYTES: u64 = 1_500_000;
 const MIN_HEADROOM_BYTES: u64 = 1_000_000_000;
 /// How often (in PDFs written) to re-check free space mid-run.
 const DISK_RECHECK_INTERVAL: usize = 250;
+/// How often the RAM guard re-measures usage.
+const MEM_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+/// Once paused, don't resume until usage drops back under this fraction of
+/// the configured limit — avoids rapidly flapping pause/resume right at the edge.
+const MEM_RESUME_FRACTION: u64 = 85;
+
+/// Total resident memory (MB) of `root` plus every descendant process (any
+/// process anywhere in its child tree) — i.e. this app plus every Chrome/Edge
+/// helper process it spawned. Chrome's multi-process architecture means each
+/// tab is its own OS process, so summing just the top-level process would
+/// badly undercount actual usage.
+fn process_tree_memory_mb(sys: &sysinfo::System, root: sysinfo::Pid) -> u64 {
+    use std::collections::HashSet;
+    let mut total_bytes: u64 = 0;
+    let mut stack = vec![root];
+    let mut seen: HashSet<sysinfo::Pid> = HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if let Some(p) = sys.process(pid) {
+            total_bytes += p.memory();
+        }
+        for (candidate_pid, candidate) in sys.processes() {
+            if candidate.parent() == Some(pid) && !seen.contains(candidate_pid) {
+                stack.push(*candidate_pid);
+            }
+        }
+    }
+    total_bytes / 1_000_000
+}
 
 /// Render one site's report HTML to a PDF via the shared headless browser,
 /// writing it into `dir` as `<host>.pdf` — one flat folder, one file per site;
@@ -215,6 +247,12 @@ async fn audit_batch(
     // User-chosen PDF output folder (via a native picker). `None` falls back
     // to Downloads, matching `save_html_report`'s convention.
     pdf_dir_override: Option<String>,
+    // User-configurable RAM ceiling (MB) for this app's whole process tree
+    // (itself + every Chrome/Edge helper it spawns). Not a hard OS-enforced
+    // limit — a cooperative guard: once usage reaches this, no *new* site
+    // audits start (in-flight ones are left to finish) until usage drops
+    // back down. `0` disables the guard entirely.
+    max_ram_mb: u64,
 ) -> Result<Vec<BatchRowOutput>, String> {
     let token = CancelToken::new();
     {
@@ -385,6 +423,52 @@ async fn audit_batch(
     let want_pdf = pdf_tx.is_some();
     let config = config;
 
+    // --- RAM guard: cooperative, not a hard OS-enforced limit. Polls this
+    // app's whole process tree (itself + every Chrome/Edge helper it
+    // spawned — Chrome's multi-process model means tab count already caps
+    // this, but this is a second, independent backstop) and flips a flag new
+    // row tasks check before starting. In-flight audits are never
+    // interrupted — only *new* ones wait, and only until usage drops back
+    // under a lower threshold, so a big batch slows near the ceiling instead
+    // of failing outright. ---
+    let over_ram_limit = Arc::new(AtomicBool::new(false));
+    let mem_monitor = if max_ram_mb > 0 {
+        let over_ram_limit = over_ram_limit.clone();
+        let app_for_mem = app.clone();
+        let my_pid = sysinfo::Pid::from_u32(std::process::id());
+        Some(tauri::async_runtime::spawn(async move {
+            let mut sys = sysinfo::System::new_all();
+            let mut paused = false;
+            loop {
+                tokio::time::sleep(MEM_POLL_INTERVAL).await;
+                sys.refresh_all();
+                let used_mb = process_tree_memory_mb(&sys, my_pid);
+                if used_mb >= max_ram_mb {
+                    if !paused {
+                        paused = true;
+                        over_ram_limit.store(true, Ordering::Relaxed);
+                        let _ = app_for_mem.emit(
+                            "batch-pdf-warning",
+                            format!(
+                                "Memory usage hit {used_mb} MB (your {max_ram_mb} MB limit) — pausing new site audits \
+                                 until in-progress ones finish and usage drops. Nothing already running is interrupted.",
+                            ),
+                        );
+                    }
+                } else if paused && used_mb < max_ram_mb * MEM_RESUME_FRACTION / 100 {
+                    paused = false;
+                    over_ram_limit.store(false, Ordering::Relaxed);
+                    let _ = app_for_mem.emit(
+                        "batch-pdf-warning",
+                        format!("Memory usage back down to {used_mb} MB — resuming new site audits."),
+                    );
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // Group rows by normalized target URL — a site listed more than once in
     // the spreadsheet (common in scraped lead lists) is crawled and PDF'd
     // once, not once per duplicate row. Empty/invalid rows need no crawl and
@@ -435,6 +519,7 @@ async fn audit_batch(
         let pdf_tx_clone = pdf_tx.clone();
         let config_template = config.clone();
         let renderer_clone = shared_renderer.clone();
+        let over_ram_limit = over_ram_limit.clone();
 
         tasks.push(async move {
             // If cancelled before starting
@@ -459,6 +544,32 @@ async fn audit_batch(
             // Acquire concurrency permit (one permit per unique site, not per row)
             let _permit = sem_clone.acquire().await.ok();
 
+            if token_clone.is_cancelled() {
+                let mut outs = Vec::with_capacity(group_rows.len());
+                for row in group_rows {
+                    let out = BatchRowOutput {
+                        index: row.index,
+                        website: row.website,
+                        updated_email: row.current_email.unwrap_or_default(),
+                        website_audit: "Error: Cancelled".to_string(),
+                        emails_found: Vec::new(),
+                        status: "error".to_string(),
+                        pdf_path: None,
+                    };
+                    let _ = app_handle.emit("batch-row-completed", &out);
+                    outs.push(out);
+                }
+                return outs;
+            }
+
+            // RAM guard: hold here (this site hasn't started crawling yet, so
+            // nothing in-flight is affected) until usage drops back down.
+            while over_ram_limit.load(Ordering::Relaxed) {
+                if token_clone.is_cancelled() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
             if token_clone.is_cancelled() {
                 let mut outs = Vec::with_capacity(group_rows.len());
                 for row in group_rows {
@@ -534,6 +645,12 @@ async fn audit_batch(
     }
 
     results.sort_by_key(|r| r.index);
+
+    // The RAM guard only needs to run while rows are still starting — every
+    // row is accounted for by now, so stop polling.
+    if let Some(h) = mem_monitor {
+        h.abort();
+    }
 
     {
         let state = app.state::<CrawlState>();
