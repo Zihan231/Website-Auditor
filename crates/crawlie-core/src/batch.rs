@@ -5,7 +5,7 @@ use crate::knowledge::rule_info;
 use crate::priority::top_fixes;
 use crate::render::Renderer;
 use crate::timefmt::format_utc;
-use crate::types::{Category, CrawlConfig, CrawlResult, Issue, Severity};
+use crate::types::{Category, CrawlConfig, CrawlEvent, CrawlResult, Issue, Severity};
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
@@ -157,13 +157,17 @@ pub fn config_for_row(template: &CrawlConfig, target_url: &str) -> CrawlConfig {
 /// the extra rendering cost. `shared_renderer`, when `config.render` is on,
 /// reuses one already-running browser across every row in the batch instead
 /// of each row launching its own.
-pub async fn audit_website_for_batch(
+pub async fn audit_website_for_batch<F>(
     config: CrawlConfig,
     cancel: CancelToken,
     generate_report_html: bool,
     shared_renderer: Option<Arc<Renderer>>,
-) -> BatchAuditOutcome {
-    match crawl_with_renderer(config, |_| {}, cancel, shared_renderer).await {
+    on_event: F,
+) -> BatchAuditOutcome
+where
+    F: FnMut(CrawlEvent) + Send,
+{
+    match crawl_with_renderer(config, on_event, cancel, shared_renderer).await {
         Err(e) => {
             BatchAuditOutcome {
                 success: false,

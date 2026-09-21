@@ -321,6 +321,17 @@ export interface BatchRowOutput {
   pdfPath: string | null;
 }
 
+/** Real-time progress update for an individual website being crawled in the batch. */
+export interface BatchSiteProgress {
+  url: string;
+  indices: number[];
+  crawled: number;
+  maxPages: number;
+  percentage: number;
+  status: "crawling" | "completed" | "error" | "paused_ram" | "cancelled";
+  currentUrl?: string;
+}
+
 /** One row's PDF finished (or definitively failed) on the background worker —
  *  fires independently of, and generally after, that row's completion. The
  *  worker keeps running after `auditBatch`'s promise resolves, so callers
@@ -346,11 +357,15 @@ export async function auditBatch(
   rowConcurrency: number,
   pdfDir: string | null,
   maxRamMb: number,
-  onRowCompleted: (row: BatchRowOutput) => void
+  onRowCompleted: (row: BatchRowOutput) => void,
+  onSiteProgress?: (progress: BatchSiteProgress) => void
 ): Promise<BatchRowOutput[]> {
   if (isTauri()) {
     const { listen } = await import("@tauri-apps/api/event");
-    const un: Unlisten = await listen<BatchRowOutput>("batch-row-completed", (ev) => onRowCompleted(ev.payload));
+    const unRow: Unlisten = await listen<BatchRowOutput>("batch-row-completed", (ev) => onRowCompleted(ev.payload));
+    const unProg: Unlisten | undefined = onSiteProgress
+      ? await listen<BatchSiteProgress>("batch-site-progress", (ev) => onSiteProgress(ev.payload))
+      : undefined;
     try {
       return await invoke<BatchRowOutput[]>("audit_batch", {
         rows,
@@ -360,10 +375,11 @@ export async function auditBatch(
         maxRamMb,
       });
     } finally {
-      un();
+      unRow();
+      unProg?.();
     }
   }
-  return runBatchDemo(rows, onRowCompleted);
+  return runBatchDemo(rows, onRowCompleted, onSiteProgress);
 }
 
 /** Listen for background PDF-report events. The PDF worker is decoupled from
@@ -392,11 +408,43 @@ export async function cancelBatch(): Promise<void> {
 
 async function runBatchDemo(
   rows: BatchRowInput[],
-  onRowCompleted: (row: BatchRowOutput) => void
+  onRowCompleted: (row: BatchRowOutput) => void,
+  onSiteProgress?: (progress: BatchSiteProgress) => void
 ): Promise<BatchRowOutput[]> {
   const results: BatchRowOutput[] = [];
   for (const row of rows) {
-    await new Promise((r) => setTimeout(r, 100));
+    if (row.website.trim() && onSiteProgress) {
+      onSiteProgress({
+        url: row.website.trim(),
+        indices: [row.index],
+        crawled: 1,
+        maxPages: 10,
+        percentage: 10,
+        status: "crawling",
+        currentUrl: `${row.website.trim()}/`,
+      });
+      await new Promise((r) => setTimeout(r, 60));
+      onSiteProgress({
+        url: row.website.trim(),
+        indices: [row.index],
+        crawled: 5,
+        maxPages: 10,
+        percentage: 50,
+        status: "crawling",
+        currentUrl: `${row.website.trim()}/about`,
+      });
+      await new Promise((r) => setTimeout(r, 60));
+      onSiteProgress({
+        url: row.website.trim(),
+        indices: [row.index],
+        crawled: 10,
+        maxPages: 10,
+        percentage: 100,
+        status: "completed",
+      });
+    } else {
+      await new Promise((r) => setTimeout(r, 100));
+    }
     const out: BatchRowOutput = row.website.trim()
       ? {
           index: row.index,

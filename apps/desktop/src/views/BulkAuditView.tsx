@@ -32,6 +32,7 @@ import {
   saveFileBytes,
   type BatchRowInput,
   type BatchRowOutput,
+  type BatchSiteProgress,
 } from "../lib/api";
 import type { CrawlConfig, UrlFilter } from "../lib/types";
 import { DEFAULT_CONFIG } from "../lib/types";
@@ -107,6 +108,7 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
 
   const [status, setStatus] = useState<AuditStatus>("idle");
   const [results, setResults] = useState<Map<number, BatchRowOutput>>(new Map());
+  const [activeSites, setActiveSites] = useState<Map<string, BatchSiteProgress>>(new Map());
   const [currentProgress, setCurrentProgress] = useState<string>("");
   const [pdfWarning, setPdfWarning] = useState<string | null>(null);
   const [exportingFormat, setExportingFormat] = useState<"csv" | "xlsx" | null>(null);
@@ -244,13 +246,43 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
             next.set(completedRow.index, completedRow);
             return next;
           });
+          setActiveSites((prev) => {
+            let modified = false;
+            const next = new Map(prev);
+            for (const [url, siteProg] of prev.entries()) {
+              if (siteProg.indices.includes(completedRow.index)) {
+                const remaining = siteProg.indices.filter((i) => i !== completedRow.index);
+                if (remaining.length === 0) {
+                  next.delete(url);
+                  modified = true;
+                } else {
+                  next.set(url, { ...siteProg, indices: remaining });
+                  modified = true;
+                }
+              }
+            }
+            return modified ? next : prev;
+          });
           setCurrentProgress(`Processed row ${completedRow.index + 1} of ${totalForProgress} (${completedRow.website || "no website"})`);
+        },
+        (progress) => {
+          setActiveSites((prev) => {
+            const next = new Map(prev);
+            if (progress.status === "completed" || progress.status === "error" || progress.status === "cancelled") {
+              next.delete(progress.url);
+            } else {
+              next.set(progress.url, progress);
+            }
+            return next;
+          });
         }
       );
       setStatus("done");
+      setActiveSites(new Map());
       setCurrentProgress("Audit complete!");
     } catch (err) {
       setStatus("done");
+      setActiveSites(new Map());
       setCurrentProgress(`Batch ended: ${String(err)}`);
     }
   };
@@ -264,6 +296,7 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
 
     setStatus("running");
     setResults(new Map());
+    setActiveSites(new Map());
     setCurrentProgress("Initializing batch...");
 
     const batchInputs: BatchRowInput[] = rows.map((row, idx) => ({
@@ -280,6 +313,7 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
   const handlePause = async () => {
     await cancelBatch();
     setStatus("paused");
+    setActiveSites(new Map());
     setCurrentProgress("Paused — click Resume to continue from where you left off.");
   };
 
@@ -300,11 +334,13 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
 
     if (remaining.length === 0) {
       setStatus("done");
+      setActiveSites(new Map());
       setCurrentProgress("Audit complete!");
       return;
     }
 
     setStatus("running");
+    setActiveSites(new Map());
     setCurrentProgress(`Resuming — ${remaining.length} row${remaining.length === 1 ? "" : "s"} left...`);
     await runBatch(remaining, rows.length);
   };
@@ -314,6 +350,7 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
   const handleCancel = async () => {
     await cancelBatch();
     setStatus("cancelled");
+    setActiveSites(new Map());
     setCurrentProgress("Audit cancelled by user.");
   };
 
@@ -1027,7 +1064,7 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
 
           {/* Progress Bar */}
           {status === "running" && (
-            <div style={{ marginBottom: 24 }}>
+            <div style={{ marginBottom: 20 }}>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 6, color: "var(--muted)" }}>
                 <span>{currentProgress}</span>
                 <span>{percentComplete}%</span>
@@ -1042,6 +1079,206 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
                   }}
                 />
               </div>
+            </div>
+          )}
+
+          {/* Active Audits (Live Individual Progress Cards) */}
+          {rows.length > 0 && (
+            <div
+              style={{
+                background: "var(--surface)",
+                border: "1px solid var(--border)",
+                borderRadius: 12,
+                padding: "16px 20px",
+                marginBottom: 24,
+                boxShadow: "0 2px 8px rgba(0, 0, 0, 0.04)",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <div
+                    style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: "50%",
+                      background:
+                        status === "running"
+                          ? "var(--green-text, #10b981)"
+                          : activeSites.size > 0
+                          ? "var(--amber, #f59e0b)"
+                          : "var(--muted)",
+                      boxShadow: status === "running" ? "0 0 0 3px rgba(16, 185, 129, 0.25)" : "none",
+                      animation: status === "running" ? "pb-pulse 1.8s infinite" : "none",
+                    }}
+                  />
+                  <span style={{ fontWeight: 600, fontSize: 13, textTransform: "uppercase", letterSpacing: "0.04em", color: "var(--foreground)" }}>
+                    Active Audits
+                  </span>
+                  <span
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 600,
+                      padding: "2px 8px",
+                      borderRadius: 10,
+                      background: status === "running" ? "rgba(59, 130, 246, 0.12)" : "rgba(100, 116, 139, 0.12)",
+                      color: status === "running" ? "var(--blue, #3b82f6)" : "var(--muted)",
+                    }}
+                  >
+                    {status === "running"
+                      ? `${activeSites.size} running in parallel`
+                      : status === "idle"
+                      ? "Ready to audit"
+                      : status === "paused"
+                      ? "Paused"
+                      : "Idle"}
+                  </span>
+                </div>
+                <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                  Slot capacity: up to {rowConcurrency} sites at once
+                </span>
+              </div>
+
+              {activeSites.size === 0 ? (
+                <div
+                  style={{
+                    padding: "20px 16px",
+                    textAlign: "center",
+                    border: "1px dashed var(--border)",
+                    borderRadius: 10,
+                    color: "var(--muted)",
+                    fontSize: 13,
+                    background: "var(--bg)",
+                  }}
+                >
+                  {status === "running"
+                    ? "Waiting for worker slots to pick up the next sites..."
+                    : status === "paused"
+                    ? "Batch paused. Click 'Resume' to continue auditing remaining sites."
+                    : `No active audits running. Click 'Start Bulk Audit' above to audit up to ${rowConcurrency} websites in parallel with live per-site progress.`}
+                </div>
+              ) : (
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
+                    gap: 12,
+                  }}
+                >
+                  {Array.from(activeSites.values()).map((site) => {
+                    const domain = site.url.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+                    const isPausedRam = site.status === "paused_ram";
+                    return (
+                      <div
+                        key={site.url}
+                        style={{
+                          background: "var(--bg)",
+                          border: `1px solid ${isPausedRam ? "var(--amber, #f59e0b)" : "var(--border)"}`,
+                          borderRadius: 10,
+                          padding: "12px 14px",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: 8,
+                          position: "relative",
+                          overflow: "hidden",
+                          transition: "border-color 0.2s ease, box-shadow 0.2s ease",
+                        }}
+                      >
+                        {/* Top: Domain name & Percentage */}
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                          <div style={{ overflow: "hidden", flex: 1 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <Globe size={13} style={{ color: "var(--muted)", flexShrink: 0 }} />
+                              <span
+                                style={{
+                                  fontWeight: 600,
+                                  fontSize: 13,
+                                  whiteSpace: "nowrap",
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                  color: "var(--foreground)",
+                                }}
+                                title={site.url}
+                              >
+                                {domain || site.url}
+                              </span>
+                            </div>
+                            <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>
+                              {site.indices.length > 1
+                                ? `Rows #${site.indices.map((i) => i + 1).join(", #")}`
+                                : `Row #${(site.indices[0] ?? 0) + 1}`}
+                            </div>
+                          </div>
+
+                          <div style={{ textAlign: "right", flexShrink: 0 }}>
+                            <span
+                              style={{
+                                fontSize: 16,
+                                fontWeight: 700,
+                                fontFamily: "var(--font-mono, monospace)",
+                                color: isPausedRam ? "var(--amber, #f59e0b)" : "var(--accent, #3b82f6)",
+                              }}
+                            >
+                              {isPausedRam ? "WAIT" : `${site.percentage}%`}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Progress Bar */}
+                        <div
+                          style={{
+                            height: 5,
+                            background: "var(--surface)",
+                            borderRadius: 3,
+                            overflow: "hidden",
+                            width: "100%",
+                          }}
+                        >
+                          <div
+                            style={{
+                              height: "100%",
+                              width: `${Math.max(2, site.percentage)}%`,
+                              background: isPausedRam
+                                ? "var(--amber, #f59e0b)"
+                                : "linear-gradient(90deg, var(--accent, #3b82f6), #60a5fa)",
+                              transition: "width 0.3s ease",
+                              borderRadius: 3,
+                            }}
+                          />
+                        </div>
+
+                        {/* Bottom: Pages counter & Current path */}
+                        <div
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                            fontSize: 11,
+                            color: "var(--muted)",
+                          }}
+                        >
+                          <span style={{ fontFamily: "var(--font-mono, monospace)" }}>
+                            {isPausedRam
+                              ? "Paused: RAM limit"
+                              : `${site.crawled} / ${site.maxPages} pages`}
+                          </span>
+                          <span
+                            style={{
+                              maxWidth: 130,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                              fontFamily: "var(--font-mono, monospace)",
+                            }}
+                            title={site.currentUrl || ""}
+                          >
+                            {site.currentUrl ? site.currentUrl.replace(/^https?:\/\/[^/]+/, "") || "/" : "Starting..."}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 

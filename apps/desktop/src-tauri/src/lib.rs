@@ -4,7 +4,8 @@
 //! Updated batch audit reporting.
 
 use crawlie_core::{
-    crawl, report_html, CancelToken, CrawlConfig, CrawlDiff, CrawlResult, ReportMeta, ReportStore,
+    crawl, report_html, CancelToken, CrawlConfig, CrawlDiff, CrawlEvent, CrawlResult, ReportMeta,
+    ReportStore,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -156,6 +157,19 @@ struct PdfJob {
 struct PdfReady {
     index: usize,
     pdf_path: Option<String>,
+}
+
+/// Live progress update for an individual website currently being audited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSiteProgress {
+    pub url: String,
+    pub indices: Vec<usize>,
+    pub crawled: usize,
+    pub max_pages: usize,
+    pub percentage: u8,
+    pub status: String, // "crawling" | "completed" | "error" | "paused_ram" | "cancelled"
+    pub current_url: Option<String>,
 }
 
 /// Hard cap on concurrent tabs across the *entire* batch's shared browser —
@@ -562,8 +576,26 @@ async fn audit_batch(
                 return outs;
             }
 
+            let row_config = crawlie_core::config_for_row(&config_template, &norm_url);
+            let indices: Vec<usize> = group_rows.iter().map(|r| r.index).collect();
+            let max_pages = row_config.max_pages;
+
             // RAM guard: hold here (this site hasn't started crawling yet, so
             // nothing in-flight is affected) until usage drops back down.
+            if over_ram_limit.load(Ordering::Relaxed) {
+                let _ = app_handle.emit(
+                    "batch-site-progress",
+                    BatchSiteProgress {
+                        url: norm_url.clone(),
+                        indices: indices.clone(),
+                        crawled: 0,
+                        max_pages,
+                        percentage: 0,
+                        status: "paused_ram".to_string(),
+                        current_url: None,
+                    },
+                );
+            }
             while over_ram_limit.load(Ordering::Relaxed) {
                 if token_clone.is_cancelled() {
                     break;
@@ -571,6 +603,18 @@ async fn audit_batch(
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             if token_clone.is_cancelled() {
+                let _ = app_handle.emit(
+                    "batch-site-progress",
+                    BatchSiteProgress {
+                        url: norm_url.clone(),
+                        indices: indices.clone(),
+                        crawled: 0,
+                        max_pages,
+                        percentage: 0,
+                        status: "cancelled".to_string(),
+                        current_url: None,
+                    },
+                );
                 let mut outs = Vec::with_capacity(group_rows.len());
                 for row in group_rows {
                     let out = BatchRowOutput {
@@ -588,13 +632,52 @@ async fn audit_batch(
                 return outs;
             }
 
+            // Emit initial progress when audit starts
+            let _ = app_handle.emit(
+                "batch-site-progress",
+                BatchSiteProgress {
+                    url: norm_url.clone(),
+                    indices: indices.clone(),
+                    crawled: 0,
+                    max_pages,
+                    percentage: 0,
+                    status: "crawling".to_string(),
+                    current_url: None,
+                },
+            );
+
+            let app_handle_prog = app_handle.clone();
+            let norm_url_prog = norm_url.clone();
+            let indices_prog = indices.clone();
+            let on_progress = move |evt: CrawlEvent| {
+                if let CrawlEvent::Progress { crawled, current, .. } = evt {
+                    let percentage = if max_pages > 0 {
+                        ((crawled as f64 / max_pages as f64) * 100.0).round().min(100.0) as u8
+                    } else {
+                        0
+                    };
+                    let _ = app_handle_prog.emit(
+                        "batch-site-progress",
+                        BatchSiteProgress {
+                            url: norm_url_prog.clone(),
+                            indices: indices_prog.clone(),
+                            crawled,
+                            max_pages,
+                            percentage,
+                            status: "crawling".to_string(),
+                            current_url: Some(current),
+                        },
+                    );
+                }
+            };
+
             // Run the audit once for this site, regardless of how many rows share it
-            let row_config = crawlie_core::config_for_row(&config_template, &norm_url);
             let outcome = crawlie_core::audit_website_for_batch(
                 row_config,
                 token_clone.clone(),
                 want_pdf,
                 renderer_clone,
+                on_progress,
             )
             .await;
 
@@ -603,6 +686,24 @@ async fn audit_batch(
             } else {
                 "error".to_string()
             };
+
+            // Emit final completed progress for this site
+            let _ = app_handle.emit(
+                "batch-site-progress",
+                BatchSiteProgress {
+                    url: norm_url.clone(),
+                    indices: indices.clone(),
+                    crawled: max_pages,
+                    max_pages,
+                    percentage: 100,
+                    status: if outcome.success {
+                        "completed".to_string()
+                    } else {
+                        "error".to_string()
+                    },
+                    current_url: None,
+                },
+            );
 
             // Hand the rendered HTML off to the background PDF worker —
             // non-blocking, so this site's rows complete at exactly the same
