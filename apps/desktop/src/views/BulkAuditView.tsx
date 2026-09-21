@@ -34,6 +34,7 @@ import {
   type BatchRowInput,
   type BatchRowOutput,
   type BatchSiteProgress,
+  type BatchPdfProgress,
 } from "../lib/api";
 import type { CrawlConfig, UrlFilter } from "../lib/types";
 import { DEFAULT_CONFIG } from "../lib/types";
@@ -110,6 +111,7 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
   const [status, setStatus] = useState<AuditStatus>("idle");
   const [results, setResults] = useState<Map<number, BatchRowOutput>>(new Map());
   const [activeSites, setActiveSites] = useState<Map<string, BatchSiteProgress>>(new Map());
+  const [activePdfs, setActivePdfs] = useState<Map<string, BatchPdfProgress>>(new Map());
   const [cancellingUrls, setCancellingUrls] = useState<Set<string>>(new Set());
   const [currentProgress, setCurrentProgress] = useState<string>("");
   const [pdfWarning, setPdfWarning] = useState<string | null>(null);
@@ -133,7 +135,18 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
           return next;
         });
       },
-      (message) => setPdfWarning(message)
+      (message) => setPdfWarning(message),
+      (progress) => {
+        setActivePdfs((prev) => {
+          const next = new Map(prev);
+          if (progress.status === "completed" || progress.status === "error") {
+            next.delete(progress.url);
+          } else {
+            next.set(progress.url, progress);
+          }
+          return next;
+        });
+      }
     ).then((un) => {
       if (cancelled) un();
       else unlisten = un;
@@ -299,6 +312,7 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
     setStatus("running");
     setResults(new Map());
     setActiveSites(new Map());
+    setActivePdfs(new Map());
     setCurrentProgress("Initializing batch...");
 
     const batchInputs: BatchRowInput[] = rows.map((row, idx) => ({
@@ -316,34 +330,39 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
     await cancelBatch();
     setStatus("paused");
     setActiveSites(new Map());
+    setActivePdfs(new Map());
     setCurrentProgress("Paused — click Resume to continue from where you left off.");
   };
 
   // Resume: re-sends only rows that never finished (never started, or were
-  // cut short by the pause) — already-completed rows are left untouched in
-  // `results`, so nothing gets audited twice.
+  // in-flight when Pause was hit and got marked with PAUSED_MARKER). Completed
+  // rows stay untouched in state and are skipped on the backend.
   const handleResume = async () => {
-    const remaining: BatchRowInput[] = rows
-      .map((row, idx) => ({
+    if (!websiteCol) return;
+
+    const remaining = rows
+      .map((row, idx) => ({ row, idx }))
+      .filter(({ idx }) => {
+        const res = results.get(idx);
+        return !res || res.websiteAudit === PAUSED_MARKER;
+      })
+      .map(({ row, idx }) => ({
         index: idx,
         website: String(row[websiteCol] || ""),
         currentEmail: emailCol ? String(row[emailCol] || "") : undefined,
-      }))
-      .filter((row) => {
-        const existing = results.get(row.index);
-        return !existing || (existing.status === "error" && existing.websiteAudit === PAUSED_MARKER);
-      });
+      }));
 
     if (remaining.length === 0) {
       setStatus("done");
-      setActiveSites(new Map());
-      setCurrentProgress("Audit complete!");
+      setCurrentProgress("All rows already completed.");
       return;
     }
 
     setStatus("running");
     setActiveSites(new Map());
-    setCurrentProgress(`Resuming — ${remaining.length} row${remaining.length === 1 ? "" : "s"} left...`);
+    setActivePdfs(new Map());
+    setCurrentProgress(`Resuming ${remaining.length} remaining rows...`);
+
     await runBatch(remaining, rows.length);
   };
 
@@ -353,6 +372,7 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
     await cancelBatch();
     setStatus("cancelled");
     setActiveSites(new Map());
+    setActivePdfs(new Map());
     setCancellingUrls(new Set());
     setCurrentProgress("Audit cancelled by user.");
   };
@@ -1381,6 +1401,184 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
                             title={site.currentUrl || ""}
                           >
                             {site.currentUrl ? site.currentUrl.replace(/^https?:\/\/[^/]+/, "") || "/" : "Starting..."}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Active PDF Generators Section */}
+          {pdfDir && (status === "running" || activePdfs.size > 0 || (successCount > 0 && pdfReadyCount < successCount)) && (
+            <div
+              style={{
+                background: "var(--surface)",
+                border: "1px solid var(--border)",
+                borderRadius: 12,
+                padding: "16px 20px",
+                marginBottom: 24,
+                boxShadow: "0 2px 8px rgba(0, 0, 0, 0.04)",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <div
+                    style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: "50%",
+                      background: activePdfs.size > 0 ? "#ec4899" : "var(--muted)",
+                      boxShadow: activePdfs.size > 0 ? "0 0 0 3px rgba(236, 72, 153, 0.25)" : "none",
+                      animation: activePdfs.size > 0 ? "pb-pulse 1.8s infinite" : "none",
+                    }}
+                  />
+                  <span style={{ fontWeight: 600, fontSize: 13, textTransform: "uppercase", letterSpacing: "0.04em", color: "var(--foreground)" }}>
+                    Active PDF Generators
+                  </span>
+                  <span
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 600,
+                      padding: "2px 8px",
+                      borderRadius: 10,
+                      background: activePdfs.size > 0 ? "rgba(236, 72, 153, 0.12)" : "rgba(100, 116, 139, 0.12)",
+                      color: activePdfs.size > 0 ? "#ec4899" : "var(--muted)",
+                    }}
+                  >
+                    {activePdfs.size > 0 ? `${activePdfs.size} rendering in parallel` : "Idle / Waiting"}
+                  </span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 12, color: "var(--muted)" }}>
+                  <span>Capacity: up to 4 parallel Chrome tabs</span>
+                  <span>•</span>
+                  <span style={{ fontWeight: 500, color: "var(--foreground)" }}>
+                    {pdfReadyCount} of {successCount} ready ({Math.max(0, successCount - pdfReadyCount)} remaining)
+                  </span>
+                </div>
+              </div>
+
+              {activePdfs.size === 0 ? (
+                <div
+                  style={{
+                    padding: "16px",
+                    textAlign: "center",
+                    border: "1px dashed var(--border)",
+                    borderRadius: 10,
+                    color: "var(--muted)",
+                    fontSize: 13,
+                    background: "var(--bg)",
+                  }}
+                >
+                  {pdfReadyCount === successCount && successCount > 0
+                    ? "All PDF reports have been generated and saved to disk."
+                    : "PDF worker is standing by for the next completed website audit…"}
+                </div>
+              ) : (
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
+                    gap: 12,
+                  }}
+                >
+                  {Array.from(activePdfs.values()).map((pdf) => {
+                    const domain = pdf.url.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+                    return (
+                      <div
+                        key={pdf.url}
+                        style={{
+                          background: "var(--bg)",
+                          border: "1px solid rgba(236, 72, 153, 0.3)",
+                          borderRadius: 10,
+                          padding: "12px 14px",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: 8,
+                          position: "relative",
+                          overflow: "hidden",
+                          boxShadow: "0 2px 6px rgba(236, 72, 153, 0.08)",
+                        }}
+                      >
+                        {/* Top: Domain & status badge */}
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <span
+                            style={{
+                              fontWeight: 600,
+                              fontSize: 13,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                              maxWidth: 180,
+                              color: "var(--foreground)",
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: 6,
+                            }}
+                            title={pdf.url}
+                          >
+                            <FileText size={14} style={{ color: "#ec4899", flexShrink: 0 }} />
+                            {domain}
+                          </span>
+                          <span
+                            style={{
+                              fontSize: 11,
+                              fontWeight: 700,
+                              fontFamily: "var(--font-mono, monospace)",
+                              color: "#ec4899",
+                              background: "rgba(236, 72, 153, 0.12)",
+                              padding: "2px 6px",
+                              borderRadius: 4,
+                            }}
+                          >
+                            PRINTING PDF
+                          </span>
+                        </div>
+
+                        {/* Progress Bar (pulsing animated gradient) */}
+                        <div
+                          style={{
+                            height: 5,
+                            background: "var(--surface)",
+                            borderRadius: 3,
+                            overflow: "hidden",
+                            width: "100%",
+                          }}
+                        >
+                          <div
+                            style={{
+                              height: "100%",
+                              width: "100%",
+                              background: "linear-gradient(90deg, #ec4899, #f43f5e, #fb7185)",
+                              borderRadius: 3,
+                              animation: "pb-pulse 1.5s infinite",
+                            }}
+                          />
+                        </div>
+
+                        {/* Bottom: Subtext */}
+                        <div
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                            fontSize: 11,
+                            color: "var(--muted)",
+                          }}
+                        >
+                          <span style={{ fontFamily: "var(--font-mono, monospace)" }}>
+                            Formatting client layout
+                          </span>
+                          <span
+                            style={{
+                              fontFamily: "var(--font-mono, monospace)",
+                              fontSize: 10,
+                              color: "var(--muted)",
+                            }}
+                          >
+                            Saving to folder…
                           </span>
                         </div>
                       </div>

@@ -341,6 +341,13 @@ export interface BatchPdfReady {
   pdfPath: string | null;
 }
 
+/** Live progress update for an individual website's PDF currently being rendered. */
+export interface BatchPdfProgress {
+  url: string;
+  indices: number[];
+  status: "rendering" | "completed" | "error";
+}
+
 /** `config` is a per-run template applied to every row (its own `url`/`mode`/
  *  `urls` are ignored — each row re-targets a clone; see `config_for_row` on
  *  the Rust side). `rowConcurrency` is a separate axis: how many *sites* run
@@ -390,15 +397,20 @@ export async function auditBatch(
  *  Returns a single teardown function for both listeners; no-ops outside Tauri. */
 export async function listenForPdfEvents(
   onPdfReady: (update: BatchPdfReady) => void,
-  onPdfWarning: (message: string) => void
+  onPdfWarning: (message: string) => void,
+  onPdfProgress?: (progress: BatchPdfProgress) => void
 ): Promise<Unlisten> {
   if (!isTauri()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
   const unReady = await listen<BatchPdfReady>("batch-pdf-ready", (ev) => onPdfReady(ev.payload));
   const unWarn = await listen<string>("batch-pdf-warning", (ev) => onPdfWarning(ev.payload));
+  const unProg = onPdfProgress
+    ? await listen<BatchPdfProgress>("batch-pdf-progress", (ev) => onPdfProgress(ev.payload))
+    : () => {};
   return () => {
     unReady();
     unWarn();
+    unProg();
   };
 }
 
