@@ -10,7 +10,7 @@ use crawlie_core::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -382,16 +382,14 @@ async fn audit_batch(
                     let app_for_worker = app.clone();
                     let dir = pdf_dir.clone();
                     let handle = tauri::async_runtime::spawn(async move {
-                        let written = Arc::new(AtomicUsize::new(0));
-                        let low_disk = Arc::new(AtomicBool::new(false));
+                        let mut written: usize = 0;
+                        let mut low_disk = false;
 
-                        // No local semaphore here: `renderer.pdf()` already
-                        // queues behind the browser's own shared tab budget
-                        // (`MAX_SHARED_RENDERER_TABS`), the same one JS-rendered
-                        // crawl pages draw from — one real ceiling on concurrent
-                        // tabs, not two independent ones that could add up.
+                        // Dedicated sequential background worker: processes completed audits
+                        // one by one from the queue. Strictly single-tab bounded so Chrome never
+                        // spikes RAM or CPU, allowing the crawler to rush ahead without throttle.
                         while let Some(job) = rx.recv().await {
-                            if low_disk.load(Ordering::Relaxed) {
+                            if low_disk {
                                 for idx in &job.indices {
                                     let _ = app_for_worker.emit(
                                         "batch-pdf-ready",
@@ -400,33 +398,29 @@ async fn audit_batch(
                                 }
                                 continue;
                             }
-                            let renderer = renderer.clone();
-                            let dir = dir.clone();
-                            let app_for_job = app_for_worker.clone();
-                            let written = written.clone();
-                            let low_disk = low_disk.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let temp_tag = job.indices.first().copied().unwrap_or(0);
-                                let pdf_path =
-                                    render_pdf_for_site(&renderer, &job.html, &dir, &job.url, temp_tag).await;
-                                for idx in &job.indices {
-                                    let _ = app_for_job.emit(
-                                        "batch-pdf-ready",
-                                        PdfReady { index: *idx, pdf_path: pdf_path.clone() },
-                                    );
-                                }
 
-                                let n = written.fetch_add(1, Ordering::Relaxed) + 1;
-                                if n % DISK_RECHECK_INTERVAL == 0
-                                    && fs4::available_space(&dir).unwrap_or(u64::MAX) < MIN_HEADROOM_BYTES
-                                    && !low_disk.swap(true, Ordering::Relaxed)
-                                {
-                                    let _ = app_for_job.emit(
-                                        "batch-pdf-warning",
-                                        "Disk space is running low — PDF generation has been disabled for the remaining rows in this batch.".to_string(),
-                                    );
-                                }
-                            });
+                            let temp_tag = job.indices.first().copied().unwrap_or(0);
+                            let pdf_path =
+                                render_pdf_for_site(&renderer, &job.html, &dir, &job.url, temp_tag).await;
+
+                            for idx in &job.indices {
+                                let _ = app_for_worker.emit(
+                                    "batch-pdf-ready",
+                                    PdfReady { index: *idx, pdf_path: pdf_path.clone() },
+                                );
+                            }
+
+                            written += 1;
+                            if written % DISK_RECHECK_INTERVAL == 0
+                                && fs4::available_space(&dir).unwrap_or(u64::MAX) < MIN_HEADROOM_BYTES
+                                && !low_disk
+                            {
+                                low_disk = true;
+                                let _ = app_for_worker.emit(
+                                    "batch-pdf-warning",
+                                    "Disk space is running low — PDF generation has been disabled for the remaining rows in this batch.".to_string(),
+                                );
+                            }
                         }
                     });
 

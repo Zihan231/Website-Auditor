@@ -1095,6 +1095,11 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
               <div style={{ fontSize: 24, fontWeight: 700, marginTop: 4, color: "var(--accent)" }}>
                 {pdfReadyCount.toLocaleString()} <span style={{ fontSize: 13, fontWeight: 400, color: "var(--muted)" }}>/ {successCount.toLocaleString()}</span>
               </div>
+              {pdfDir && successCount > 0 && (
+                <div style={{ fontSize: 11, marginTop: 4, color: pdfReadyCount < successCount ? "var(--blue, #3b82f6)" : "var(--green-text, #10b981)", fontWeight: 500 }}>
+                  {pdfReadyCount < successCount ? "Worker generating in background…" : "All PDFs generated"}
+                </div>
+              )}
             </div>
           </div>
 
@@ -1395,6 +1400,27 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
                 <span style={{ fontSize: 12, color: "var(--muted)" }}>
                   Showing {previewRows.length} of {totalRows}
                 </span>
+                {pdfDir && successCount > 0 && (
+                  <span
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 600,
+                      padding: "2px 8px",
+                      borderRadius: 6,
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 5,
+                      background: pdfReadyCount < successCount ? "rgba(59, 130, 246, 0.12)" : "rgba(16, 185, 129, 0.12)",
+                      color: pdfReadyCount < successCount ? "var(--blue, #3b82f6)" : "var(--green-text, #10b981)",
+                      border: `1px solid ${pdfReadyCount < successCount ? "rgba(59, 130, 246, 0.25)" : "rgba(16, 185, 129, 0.25)"}`,
+                    }}
+                  >
+                    <FileText size={11} />
+                    {pdfReadyCount < successCount
+                      ? `PDFs: ${pdfReadyCount}/${successCount} ready (worker active)`
+                      : `All ${pdfReadyCount} PDFs ready`}
+                  </span>
+                )}
               </div>
               <div style={{ display: "flex", gap: 12 }}>
                 <div style={{ position: "relative" }}>
