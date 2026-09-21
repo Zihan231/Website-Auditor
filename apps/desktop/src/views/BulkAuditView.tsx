@@ -23,6 +23,7 @@ import {
 import {
   auditBatch,
   cancelBatch,
+  cancelBatchSite,
   isTauri,
   listenForPdfEvents,
   openExternal,
@@ -109,6 +110,7 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
   const [status, setStatus] = useState<AuditStatus>("idle");
   const [results, setResults] = useState<Map<number, BatchRowOutput>>(new Map());
   const [activeSites, setActiveSites] = useState<Map<string, BatchSiteProgress>>(new Map());
+  const [cancellingUrls, setCancellingUrls] = useState<Set<string>>(new Set());
   const [currentProgress, setCurrentProgress] = useState<string>("");
   const [pdfWarning, setPdfWarning] = useState<string | null>(null);
   const [exportingFormat, setExportingFormat] = useState<"csv" | "xlsx" | null>(null);
@@ -351,7 +353,70 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
     await cancelBatch();
     setStatus("cancelled");
     setActiveSites(new Map());
+    setCancellingUrls(new Set());
     setCurrentProgress("Audit cancelled by user.");
+  };
+
+  // Cancel an individual website among the parallel audits
+  const handleCancelSite = async (url: string) => {
+    setCancellingUrls((prev) => new Set(prev).add(url));
+    try {
+      await cancelBatchSite(url);
+    } catch (err) {
+      console.error("Failed to cancel site:", err);
+    }
+  };
+
+  // Manually skip a website directly from the spreadsheet table cell / row
+  const handleSkipRow = async (rowIdx: number, website: string) => {
+    const trimmed = website.trim();
+    if (trimmed) {
+      setCancellingUrls((prev) => new Set(prev).add(trimmed));
+      try {
+        await cancelBatchSite(trimmed);
+      } catch (err) {
+        console.error("Failed to cancel site:", err);
+      }
+    }
+    setResults((prev) => {
+      const next = new Map(prev);
+      next.set(rowIdx, {
+        index: rowIdx,
+        website: trimmed,
+        updatedEmail: "",
+        websiteAudit: "Cancelled: Skipped by user",
+        emailsFound: [],
+        status: "skipped",
+        pdfPath: null,
+      });
+      if (trimmed && websiteCol) {
+        rows.forEach((r, idx) => {
+          if (r[websiteCol]?.trim() === trimmed && !next.has(idx)) {
+            next.set(idx, {
+              index: idx,
+              website: trimmed,
+              updatedEmail: "",
+              websiteAudit: "Cancelled: Skipped by user",
+              emailsFound: [],
+              status: "skipped",
+              pdfPath: null,
+            });
+          }
+        });
+      }
+      return next;
+    });
+    setActiveSites((prev) => {
+      let modified = false;
+      const next = new Map(prev);
+      for (const [url, prog] of prev.entries()) {
+        if (url === trimmed || url.includes(trimmed) || prog.indices.includes(rowIdx)) {
+          next.delete(url);
+          modified = true;
+        }
+      }
+      return modified ? next : prev;
+    });
   };
 
   // Export Enriched File
@@ -1167,12 +1232,13 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
                   {Array.from(activeSites.values()).map((site) => {
                     const domain = site.url.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
                     const isPausedRam = site.status === "paused_ram";
+                    const isCancelling = cancellingUrls.has(site.url) || cancellingUrls.has(domain);
                     return (
                       <div
                         key={site.url}
                         style={{
                           background: "var(--bg)",
-                          border: `1px solid ${isPausedRam ? "var(--amber, #f59e0b)" : "var(--border)"}`,
+                          border: `1px solid ${isPausedRam ? "var(--amber, #f59e0b)" : isCancelling ? "var(--muted)" : "var(--border)"}`,
                           borderRadius: 10,
                           padding: "12px 14px",
                           display: "flex",
@@ -1180,10 +1246,11 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
                           gap: 8,
                           position: "relative",
                           overflow: "hidden",
-                          transition: "border-color 0.2s ease, box-shadow 0.2s ease",
+                          opacity: isCancelling ? 0.6 : 1,
+                          transition: "border-color 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease",
                         }}
                       >
-                        {/* Top: Domain name & Percentage */}
+                        {/* Top: Domain name & Percentage & Cancel button */}
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
                           <div style={{ overflow: "hidden", flex: 1 }}>
                             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -1209,17 +1276,54 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
                             </div>
                           </div>
 
-                          <div style={{ textAlign: "right", flexShrink: 0 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
                             <span
                               style={{
                                 fontSize: 16,
                                 fontWeight: 700,
                                 fontFamily: "var(--font-mono, monospace)",
-                                color: isPausedRam ? "var(--amber, #f59e0b)" : "var(--accent, #3b82f6)",
+                                color: isCancelling
+                                  ? "var(--muted)"
+                                  : isPausedRam
+                                  ? "var(--amber, #f59e0b)"
+                                  : "var(--accent, #3b82f6)",
                               }}
                             >
-                              {isPausedRam ? "WAIT" : `${site.percentage}%`}
+                              {isCancelling ? "SKIP" : isPausedRam ? "WAIT" : `${site.percentage}%`}
                             </span>
+                            <button
+                              type="button"
+                              className="icon-btn"
+                              disabled={isCancelling}
+                              onClick={() => handleCancelSite(site.url)}
+                              title="Skip this website and start next"
+                              style={{
+                                padding: 3,
+                                borderRadius: 5,
+                                border: "1px solid var(--border)",
+                                background: "var(--surface)",
+                                cursor: isCancelling ? "default" : "pointer",
+                                color: "var(--muted)",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                transition: "all 0.15s ease",
+                              }}
+                              onMouseEnter={(e) => {
+                                if (!isCancelling) {
+                                  e.currentTarget.style.color = "var(--error, #ef4444)";
+                                  e.currentTarget.style.borderColor = "var(--error, #ef4444)";
+                                }
+                              }}
+                              onMouseLeave={(e) => {
+                                if (!isCancelling) {
+                                  e.currentTarget.style.color = "var(--muted)";
+                                  e.currentTarget.style.borderColor = "var(--border)";
+                                }
+                              }}
+                            >
+                              <X size={12} />
+                            </button>
                           </div>
                         </div>
 
@@ -1327,14 +1431,21 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
                     <th style={{ padding: "10px 16px", width: 220 }}>Website</th>
                     <th style={{ padding: "10px 16px", width: 220 }}>Email (Enriched)</th>
                     <th style={{ padding: "10px 16px" }}>Website Audit Preview</th>
-                    <th style={{ padding: "10px 16px", width: 110 }}>Status</th>
+                    <th style={{ padding: "10px 16px", width: 140 }}>Status</th>
                   </tr>
                 </thead>
                 <tbody>
                   {previewRows.slice(0, 100).map(({ row, idx, result }) => {
                     const isExpanded = expandedIndex === idx;
                     const websiteVal = row[websiteCol] || "";
+                    const trimmedWebsite = websiteVal.trim();
                     const emailVal = result ? result.updatedEmail : (row[emailCol] || "—");
+
+                    // Check if this row is currently being audited or cancelling
+                    const activeSiteInfo = Array.from(activeSites.values()).find(
+                      (s) => s.indices.includes(idx) || (trimmedWebsite && s.url.includes(trimmedWebsite))
+                    );
+                    const isCancelling = cancellingUrls.has(trimmedWebsite) || (activeSiteInfo ? cancellingUrls.has(activeSiteInfo.url) : false);
 
                     return (
                       <tr
@@ -1427,13 +1538,64 @@ export function BulkAuditView({ onBack }: { onBack?: () => void }) {
                             </div>
                           ) : (
                             <span style={{ color: "var(--muted)", fontStyle: "italic" }}>
-                              {status === "running" ? "Queued..." : "Ready"}
+                              {status === "running"
+                                ? (activeSiteInfo ? `Auditing (${activeSiteInfo.crawled}/${activeSiteInfo.maxPages || 10} p)` : "Queued...")
+                                : "Ready"}
                             </span>
                           )}
                         </td>
                         <td style={{ padding: "12px 16px" }}>
                           {!result ? (
-                            <span style={{ color: "var(--muted)", fontSize: 12 }}>Pending</span>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                              {activeSiteInfo ? (
+                                <span
+                                  className="badge"
+                                  style={{
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: 4,
+                                    fontSize: 11,
+                                    padding: "2px 6px",
+                                    background: "rgba(59, 130, 246, 0.12)",
+                                    color: "#3b82f6",
+                                    border: "1px solid rgba(59, 130, 246, 0.25)",
+                                  }}
+                                >
+                                  {isCancelling ? "Skipping..." : `${activeSiteInfo.percentage}%`}
+                                </span>
+                              ) : (
+                                <span style={{ color: "var(--muted)", fontSize: 12 }}>Pending</span>
+                              )}
+                              {(status === "running" || status === "paused") && websiteVal && !isCancelling && (
+                                <button
+                                  type="button"
+                                  className="btn btn-secondary btn-sm"
+                                  onClick={() => handleSkipRow(idx, websiteVal)}
+                                  title="Skip this website from audit"
+                                  style={{
+                                    padding: "2px 6px",
+                                    fontSize: 11,
+                                    height: 22,
+                                    lineHeight: "18px",
+                                    borderRadius: 4,
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: 3,
+                                    color: "var(--danger, #ef4444)",
+                                    borderColor: "rgba(239, 68, 68, 0.25)",
+                                    cursor: "pointer",
+                                  }}
+                                >
+                                  <X size={10} />
+                                  Skip
+                                </button>
+                              )}
+                              {isCancelling && (
+                                <span style={{ color: "var(--muted)", fontSize: 11, fontStyle: "italic" }}>
+                                  Skipping…
+                                </span>
+                              )}
+                            </div>
                           ) : result.status === "success" ? (
                             <span className="badge badge-good" style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
                               <CheckCircle2 size={12} /> Audited

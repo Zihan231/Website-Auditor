@@ -23,6 +23,8 @@ struct CrawlState {
     /// run, if any is still draining. Aborted when a new batch starts or the
     /// batch is cancelled, so runs never overlap.
     pdf_worker: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    /// Active per-site cancellation notifiers, keyed by normalized URL.
+    site_cancels: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
 }
 
 /// User-configurable app settings, persisted to `settings.json` in the app data
@@ -536,6 +538,31 @@ async fn audit_batch(
         let over_ram_limit = over_ram_limit.clone();
 
         tasks.push(async move {
+            let site_notify = Arc::new(tokio::sync::Notify::new());
+            {
+                let state = app_handle.state::<CrawlState>();
+                state
+                    .site_cancels
+                    .lock()
+                    .unwrap()
+                    .insert(norm_url.clone(), site_notify.clone());
+            }
+
+            struct SiteGuard {
+                app: AppHandle,
+                url: String,
+            }
+            impl Drop for SiteGuard {
+                fn drop(&mut self) {
+                    let state = self.app.state::<CrawlState>();
+                    state.site_cancels.lock().unwrap().remove(&self.url);
+                }
+            }
+            let _guard = SiteGuard {
+                app: app_handle.clone(),
+                url: norm_url.clone(),
+            };
+
             // If cancelled before starting
             if token_clone.is_cancelled() {
                 let mut outs = Vec::with_capacity(group_rows.len());
@@ -555,19 +582,36 @@ async fn audit_batch(
                 return outs;
             }
 
-            // Acquire concurrency permit (one permit per unique site, not per row)
-            let _permit = sem_clone.acquire().await.ok();
+            // Acquire concurrency permit, but allow instant per-site skip while waiting in queue
+            let site_notify_sem = site_notify.clone();
+            let permit_res = tokio::select! {
+                biased;
+                _ = site_notify_sem.notified() => None,
+                p = sem_clone.acquire() => p.ok(),
+            };
 
-            if token_clone.is_cancelled() {
+            if permit_res.is_none() || token_clone.is_cancelled() {
+                let _ = app_handle.emit(
+                    "batch-site-progress",
+                    BatchSiteProgress {
+                        url: norm_url.clone(),
+                        indices: group_rows.iter().map(|r| r.index).collect(),
+                        crawled: 0,
+                        max_pages: 0,
+                        percentage: 0,
+                        status: "cancelled".to_string(),
+                        current_url: None,
+                    },
+                );
                 let mut outs = Vec::with_capacity(group_rows.len());
                 for row in group_rows {
                     let out = BatchRowOutput {
                         index: row.index,
                         website: row.website,
                         updated_email: row.current_email.unwrap_or_default(),
-                        website_audit: "Error: Cancelled".to_string(),
+                        website_audit: "Cancelled: Skipped by user".to_string(),
                         emails_found: Vec::new(),
-                        status: "error".to_string(),
+                        status: "skipped".to_string(),
                         pdf_path: None,
                     };
                     let _ = app_handle.emit("batch-row-completed", &out);
@@ -575,13 +619,13 @@ async fn audit_batch(
                 }
                 return outs;
             }
+            let _permit = permit_res;
 
             let row_config = crawlie_core::config_for_row(&config_template, &norm_url);
             let indices: Vec<usize> = group_rows.iter().map(|r| r.index).collect();
             let max_pages = row_config.max_pages;
 
-            // RAM guard: hold here (this site hasn't started crawling yet, so
-            // nothing in-flight is affected) until usage drops back down.
+            // RAM guard: hold here until usage drops back down, or exit immediately if skipped
             if over_ram_limit.load(Ordering::Relaxed) {
                 let _ = app_handle.emit(
                     "batch-site-progress",
@@ -596,13 +640,22 @@ async fn audit_batch(
                     },
                 );
             }
+            let site_notify_ram = site_notify.clone();
+            let mut ram_cancelled = false;
             while over_ram_limit.load(Ordering::Relaxed) {
                 if token_clone.is_cancelled() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::select! {
+                    biased;
+                    _ = site_notify_ram.notified() => {
+                        ram_cancelled = true;
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
             }
-            if token_clone.is_cancelled() {
+            if ram_cancelled || token_clone.is_cancelled() {
                 let _ = app_handle.emit(
                     "batch-site-progress",
                     BatchSiteProgress {
@@ -621,9 +674,17 @@ async fn audit_batch(
                         index: row.index,
                         website: row.website,
                         updated_email: row.current_email.unwrap_or_default(),
-                        website_audit: "Error: Cancelled".to_string(),
+                        website_audit: if ram_cancelled {
+                            "Cancelled: Skipped by user".to_string()
+                        } else {
+                            "Error: Cancelled".to_string()
+                        },
                         emails_found: Vec::new(),
-                        status: "error".to_string(),
+                        status: if ram_cancelled {
+                            "skipped".to_string()
+                        } else {
+                            "error".to_string()
+                        },
                         pdf_path: None,
                     };
                     let _ = app_handle.emit("batch-row-completed", &out);
@@ -671,32 +732,52 @@ async fn audit_batch(
                 }
             };
 
-            // Run the audit once for this site, regardless of how many rows share it
-            let outcome = crawlie_core::audit_website_for_batch(
+            let site_notify_audit = site_notify.clone();
+            let audit_fut = crawlie_core::audit_website_for_batch(
                 row_config,
                 token_clone.clone(),
                 want_pdf,
                 renderer_clone,
                 on_progress,
-            )
-            .await;
+            );
 
-            let status = if outcome.success {
+            // Run the audit with instant abort capability if user skips this site
+            let (outcome, is_user_skip) = tokio::select! {
+                biased;
+                _ = site_notify_audit.notified() => {
+                    (
+                        crawlie_core::BatchAuditOutcome {
+                            success: false,
+                            report: "Cancelled: Skipped by user".to_string(),
+                            emails: Vec::new(),
+                            report_html: None,
+                        },
+                        true,
+                    )
+                }
+                res = audit_fut => (res, false),
+            };
+
+            let status = if is_user_skip {
+                "skipped".to_string()
+            } else if outcome.success {
                 "success".to_string()
             } else {
                 "error".to_string()
             };
 
-            // Emit final completed progress for this site
+            // Emit final completed/cancelled progress for this site
             let _ = app_handle.emit(
                 "batch-site-progress",
                 BatchSiteProgress {
                     url: norm_url.clone(),
                     indices: indices.clone(),
-                    crawled: max_pages,
+                    crawled: if is_user_skip { 0 } else { max_pages },
                     max_pages,
-                    percentage: 100,
-                    status: if outcome.success {
+                    percentage: if is_user_skip { 0 } else { 100 },
+                    status: if is_user_skip {
+                        "cancelled".to_string()
+                    } else if outcome.success {
                         "completed".to_string()
                     } else {
                         "error".to_string()
@@ -771,8 +852,38 @@ fn cancel_batch(state: State<'_, CrawlState>) {
     if let Some(token) = state.batch_cancel.lock().unwrap().as_ref() {
         token.cancel();
     }
+    // Also notify any site waiting on cancel
+    let map = state.site_cancels.lock().unwrap();
+    for notify in map.values() {
+        notify.notify_waiters();
+    }
     if let Some(h) = state.pdf_worker.lock().unwrap().take() {
         h.abort();
+    }
+}
+
+/// Cancel / skip an individual website in the batch without stopping other sites.
+#[tauri::command]
+fn cancel_batch_site(state: State<'_, CrawlState>, url: String) {
+    let trimmed = url.trim();
+    let map = state.site_cancels.lock().unwrap();
+    if let Some(notify) = map.get(trimmed) {
+        notify.notify_waiters();
+        return;
+    }
+    if let Some(norm) = crawlie_core::normalize_target_url(trimmed) {
+        if let Some(notify) = map.get(&norm) {
+            notify.notify_waiters();
+            return;
+        }
+    }
+    for (k, notify) in map.iter() {
+        if k.trim_end_matches('/') == trimmed.trim_end_matches('/')
+            || k.contains(trimmed)
+            || trimmed.contains(k.as_str())
+        {
+            notify.notify_waiters();
+        }
     }
 }
 
@@ -907,6 +1018,7 @@ pub fn run() {
             cancel_crawl,
             audit_batch,
             cancel_batch,
+            cancel_batch_site,
             list_reports,
             load_report,
             delete_report,

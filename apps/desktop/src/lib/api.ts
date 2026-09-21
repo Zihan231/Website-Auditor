@@ -406,6 +406,10 @@ export async function cancelBatch(): Promise<void> {
   if (isTauri()) await invoke("cancel_batch");
 }
 
+export async function cancelBatchSite(url: string): Promise<void> {
+  if (isTauri()) await invoke("cancel_batch_site", { url });
+}
+
 async function runBatchDemo(
   rows: BatchRowInput[],
   onRowCompleted: (row: BatchRowOutput) => void,
